@@ -2,9 +2,9 @@
 // 全局参数。PRD 中标注"待确认"的数值在此给出可调整的默认值（DEFAULT），评审确认后只需修改本文件。
 (function (CM) {
   CM.CFG = {
-    GAME_VERSION: '2.6.1',
+    GAME_VERSION: '2.10.2',
     TRAFFIC_MODEL: 4,      // 轻量交通更新；与显示版本独立，确保 v3 存档仍触发安全迁移
-    RULES_REVISION: 7,     // Web v2.5.1: fare and alignment fixes; protect original saves before upgrade.
+    RULES_REVISION: 9,     // Web v2.9.0: linked stations (passage transfer) may share one name. v2.10.0/v2.10.1 仅渲染与站名显示变更，规则不变。
     SAVE_FORMAT: 'city-metro-save',
     SAVE_VERSION: 2,
     SAVE_MIN_VERSION: 2,   // 1.1 起地图改为真实地理，旧版存档的城市数据与之不兼容

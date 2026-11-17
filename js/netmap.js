@@ -6,6 +6,48 @@
   const U = CM.U, M = CM.Metro, h = U.h;
   let ui = null, root = null, view = null, focus = null, useDraft = false, openedGameId = null;
   function game() { return CM.game; }
+  function railToast(text) { try { if (ui && ui.toast) ui.toast(text, 'info'); } catch (e) { } }
+
+  // 铁路经营权（v2.8）的线路与车站只存在于编译后的线网（overlay）里，不在玩家的 g.net.lines 里。
+  // 线路图把它们作为只读附加层读取：line.rail / station.rail 有值即为铁路公司管理。
+  function compiledNet(g) {
+    if (!g) return null;
+    try {
+      const C = useDraft && g.draft && typeof g.draftCompiled === 'function' ? g.draftCompiled() : g.compiled;
+      return C && C.net && C.net.lines && C.net.stations && C.net.segments ? C.net : null;
+    } catch (e) { return null; }
+  }
+  // 收集铁路层（容错：没有编译网、没有铁路、没有区间都返回空结构）
+  function railLayer(g) {
+    const out = { has: false, ids: [], lines: {}, stations: {}, segments: [], segs: {}, count: {}, net: null };
+    out.net = { lines: out.lines, stations: out.stations, segments: out.segs };
+    if (!g) return out;
+    const cnet = compiledNet(g);
+    if (!cnet) return out;
+    for (const lid of M.sortIds(Object.keys(cnet.lines))) {
+      const L = cnet.lines[lid];
+      if (L && L.rail) { out.lines[lid] = L; out.ids.push(lid); out.count[lid] = 0; }
+    }
+    if (!out.ids.length) return out;
+    const seen = new Set();
+    for (const sid of Object.keys(cnet.segments)) {
+      const sg = cnet.segments[sid];
+      if (!sg || !out.lines[sg.line]) continue;
+      const a = cnet.stations[sg.a], b = cnet.stations[sg.b];
+      if (!a || !b) continue;
+      if (!seen.has(sid)) { seen.add(sid); out.segments.push(sg); out.segs[sid] = sg; }
+      for (const st of [a, b]) if (st.rail && !out.stations[st.id]) out.stations[st.id] = st;
+    }
+    // 铁路车站 v2.8.1 起也同步在玩家线网里（站台层、天地换乘等字段以玩家线网为准）
+    const pnet = useDraft && g.draft ? g.draft.net : g.net;
+    for (const sid in out.stations) {
+      const p = pnet && pnet.stations && pnet.stations[sid];
+      if (p) out.stations[sid] = Object.assign({}, out.stations[sid], { name: p.name, x: p.x, y: p.y });
+    }
+    for (const sg of out.segments) for (const sid of [sg.a, sg.b]) if (out.count[sg.line] != null && seen.has(sid + '|' + sg.line) === false) { seen.add(sid + '|' + sg.line); out.count[sg.line]++; }
+    out.has = out.segments.length > 0 || Object.keys(out.stations).length > 0;
+    return out;
+  }
 
   // 站外换乘：两座不同线路的运营车站之间可步行换乘（来自交通模型，只在正式网络上有）
   function walkTransfers(g, net) {
@@ -520,16 +562,25 @@
   function build(g, spacing, attempt) {
     spacing = spacing || 1; attempt = attempt || 0;
     const net = useDraft && g.draft ? g.draft.net : g.net;
+    const rail = railLayer(g);
     const xfers = walkTransfers(g, net);
-    const lay = layout(net, xfers);
+    let lay = layout(net, xfers);
+    // 玩家还没有线路时，线路图仍然把铁路画出来（铁路是只读附加层，1964 年前的东京 / 2012 年前的上海没有铁路）
+    const railOnly = !lay.st.length && rail.has;
+    const drawNet = railOnly ? rail.net : net;
+    if (railOnly) lay = layout(rail.net, []);
+    if (!lay.st.length) return h('div', { class: 'nm-empty' }, CM.icon('network', 40), h('div', null, useDraft ? '草案中还没有轨道。' : '还没有运营线路。'), h('div', { class: 'tiny muted' }, '用「绘线」工具连接两座以上的车站，确认建设后会显示在这里。'));
+    const stOf = function (sid) { return (net.stations && net.stations[sid]) || rail.stations[sid]; };
+    // 先按玩家线网完成投影与拉直（与不加铁路时完全一致），再把铁路车站作为附加节点接进来；
+    // 这样铁路不会改变玩家线网的布局、站位与线形，1964 年前 / 2012 年前也不会多出任何东西。
+    const base = projection(drawNet, lay, spacing);
+    if (!geographic) straighten(drawNet, lay, base);
+    if (!geographic) base.nodes = lay.st.map(function (sid) { const s = stOf(sid); return { id: sid, p: base(s.x, s.y) }; });
+    for (const sid in rail.stations) if (lay.st.indexOf(sid) < 0) { lay.nb.push([]); lay.st.push(sid); }
     const N = lay.st.length;
-    if (!N) return h('div', { class: 'nm-empty' }, CM.icon('network', 40), h('div', null, useDraft ? '草案中还没有轨道。' : '还没有运营线路。'), h('div', { class: 'tiny muted' }, '用「绘线」工具连接两座以上的车站，确认建设后会显示在这里。'));
-    const base = projection(net, lay, spacing);
-    if (!geographic) straighten(net, lay, base);
-    if (!geographic) base.nodes = lay.st.map(function (sid) { const s = net.stations[sid]; return { id: sid, p: base(s.x, s.y) }; });
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
     const bound = function (p) { x0 = Math.min(x0, p[0]); x1 = Math.max(x1, p[0]); y0 = Math.min(y0, p[1]); y1 = Math.max(y1, p[1]); };
-    for (const sid of lay.st) { const s = net.stations[sid]; bound(base(s.x, s.y)); }
+    for (const sid of lay.st) { const s = stOf(sid); bound(base(s.x, s.y)); }
     const tracks = [], sharedRoutes = new Map();
     for (const id of M.sortIds(Object.keys(net.segments))) {
       const s = net.segments[id];
@@ -548,7 +599,26 @@
       tracks.push(track);
     }
     const stationAnchors = !geographic ? parallelRoutes(tracks, net, base) : new Map();
+    // 铁路线路：只读附加层，用同一套投影，但不参与玩家线网的走廊分配与布局
+    const railTracks = [];
+    for (const sg of rail.segments) {
+      const A = stOf(sg.a), B = stOf(sg.b);
+      if (!A || !B) continue;
+      let pts = null;
+      try {
+        const cnet = compiledNet(g);
+        const gmm = cnet ? M.segGeom(cnet, sg, g.city) : null;
+        if (gmm && gmm.pts && gmm.pts.length > 1) pts = gmm.pts;
+      } catch (e) { pts = null; }
+      if (!pts) pts = [[A.x, A.y], [B.x, B.y]];
+      let screen = base.path(pts), route = null;
+      if (!geographic) {
+        try { route = diagramRoute({ seg: sg, geom: { pts: pts }, screen: screen.slice() }, rail.net, base); if (route) screen = route.samples; } catch (e) { route = null; }
+      }
+      railTracks.push({ seg: sg, geom: { pts: pts }, screen: screen, route: route });
+    }
     for (const track of tracks) track.screen.forEach(bound);
+    for (const track of railTracks) track.screen.forEach(bound);
     for (const anchors of stationAnchors.values()) anchors.forEach(bound);
     const pad = 64, W = x1 - x0 + 2 * pad, H = y1 - y0 + 2 * pad;
     base.ox = pad - x0; base.oy = pad - y0;
@@ -556,11 +626,18 @@
       for (const p of track.screen) { p[0] += base.ox; p[1] += base.oy; }
       if (track.route) for (const p of track.route.raw) { p[0] += base.ox; p[1] += base.oy; }
     }
+    for (const track of railTracks) {
+      for (const p of track.screen) { p[0] += base.ox; p[1] += base.oy; }
+      if (track.route) for (const p of track.route.raw) { p[0] += base.ox; p[1] += base.oy; }
+    }
     for (const anchors of stationAnchors.values()) for (const p of anchors) { p[0] += base.ox; p[1] += base.oy; }
-    const positions = lay.st.map(function (sid) { const s = net.stations[sid]; return base(s.x, s.y); });
+    const positions = lay.st.map(function (sid) { const s = stOf(sid); return base(s.x, s.y); });
     const px = function (i) { return positions[i][0]; }, py = function (i) { return positions[i][1]; };
     const linesOf = lay.st.map(function () { return []; });
     for (const e of lay.edges) for (const l of e.lines) { if (linesOf[e.a].indexOf(l.lid) < 0) linesOf[e.a].push(l.lid); if (linesOf[e.b].indexOf(l.lid) < 0) linesOf[e.b].push(l.lid); }
+    const allLines = Object.assign({}, net.lines, rail.lines);
+    // 铁路车站所属的只读线路（铁路线路不在玩家线网的 lines 里）
+    for (const sg of rail.segments) for (const sid of [sg.a, sg.b]) { const i = lay.st.indexOf(sid); if (i >= 0 && linesOf[i].indexOf(sg.line) < 0) linesOf[i].push(sg.line); }
     const walkSet = new Set(); for (const e of lay.xEdges) { walkSet.add(e.a); walkSet.add(e.b); }
     // 占位：车站、线路（每 9 px 一个小方块）
     const index = labelIndex(), boxes = index.boxes;
@@ -583,6 +660,30 @@
     };
     for (const track of tracks) occupy(track.screen);
     for (const e of lay.xEdges) occupy([[px(e.a), py(e.a)], [px(e.b), py(e.b)]]);
+    const measure = document.createElement('canvas').getContext('2d'), font = getComputedStyle(document.body).fontFamily;
+    // 铁路线路名称：沿线放一个小标签，并参与站名避让（铁路公司管理，只读）
+    let railNames = '';
+    for (const lid of rail.ids) {
+      const L = rail.lines[lid], tr = railTracks.find(function (t) { return t.seg.line === lid; });
+      if (!L || !tr || tr.screen.length < 2) continue;
+      measure.font = '700 13px ' + font;
+      const text = String(L.name || '铁路'), f = function (v) { return v.toFixed(1); };
+      const li = tr.screen.length - 1, dx = tr.screen[li][0] - tr.screen[0][0], dy = tr.screen[li][1] - tr.screen[0][1], len = Math.hypot(dx, dy) || 1;
+      const nx = -dy / len, ny = dx / len, w = Math.ceil(measure.measureText(text).width) + 16, hh2 = 22;
+      let best = null;
+      for (const frac of [0.5, 0.66, 0.34, 0.82, 0.18]) {
+        const p = AX.pointOn(tr.screen, frac);
+        for (const side of [1, -1]) {
+          const cx = p[0] + nx * side * (hh2 / 2 + 10), cy = p[1] + ny * side * (hh2 / 2 + 10);
+          const box = [cx - w / 2, cy - hh2 / 2, cx + w / 2, cy + hh2 / 2], ov = overlap(box);
+          if (!best || ov < best.ov) best = { x: cx, y: cy, b: box, ov: ov };
+        }
+        if (best && !best.ov) break;
+      }
+      if (!best) continue;
+      index.add(best.b, 8); expand(best.b);
+      railNames += '<g data-lines="' + lid + '" data-rail-line="' + lid + '" data-rail="1"><rect x="' + f(best.x - w / 2) + '" y="' + f(best.y - hh2 / 2) + '" width="' + w + '" height="' + hh2 + '" rx="7" fill="' + AX.line(L) + '" opacity=".96"/><text x="' + f(best.x) + '" y="' + f(best.y + 4.5) + '" text-anchor="middle" class="nm-badge-t" style="fill:' + AX.ink(AX.line(L)) + '">' + U.esc(text) + '</text><title>' + U.esc(text + ' · 铁路公司管理（只读）') + '</title></g>';
+    }
     const origin = base(0, 0);
     const axes = ' data-projection="' + (geographic ? 'geographic' : 'octilinear') + '" data-axis-x="' + JSON.stringify(base.ax.knots.map(function (k) { return [k[0], base(k[0], 0)[0]]; })) + '" data-axis-y="' + JSON.stringify(base.ay.knots.map(function (k) { return [k[0], base(0, k[0])[1]]; })) + '"';
     let svg = '<svg class="nm-svg" data-mode="' + (geographic ? 'geographic' : 'schematic') + '" data-spacing="' + spacing + '"' + axes + ' data-scale="' + base.scale + '" data-origin-x="' + origin[0] + '" data-origin-y="' + origin[1] + '" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + W.toFixed(0) + ' ' + H.toFixed(0) + '">';
@@ -612,8 +713,18 @@
         group.forEach(function (track, i) { routes += geoSeg(track, base, net, widths[i]); });
       }
     }
+    // 铁路只读层画在玩家线网下面一层：底形 + 线路色 + 白色虚线芯（铁路样式）
+    if (railTracks.length) {
+      let railCase = '', railBody = '';
+      for (const track of railTracks) {
+        const L = rail.lines[track.seg.line] || {}, col = AX.line(L) || '#8a6d3b', d = routeD(track);
+        railCase += '<path data-lines="' + track.seg.line + '" d="' + d + '" stroke-width="13"/>';
+        railBody += '<path data-lines="' + track.seg.line + '" data-rail-line="' + track.seg.line + '" data-rail="1" d="' + d + '" stroke="' + col + '" stroke-width="9"><title>' + U.esc((L.name || '铁路') + ' · 铁路公司管理（只读）') + '</title></path><path data-lines="' + track.seg.line + '" d="' + d + '" stroke="#fff" stroke-width="2" stroke-dasharray="6 5" opacity=".85"/>';
+      }
+      svg += '<g class="nm-rail-casing" fill="none" stroke-linecap="round" stroke-linejoin="round" style="stroke:var(--surface-solid,#fff)">' + railCase + '</g><g class="nm-rail-lines" fill="none" stroke-linecap="round" stroke-linejoin="round">' + railBody + '</g>';
+    }
     svg += '<g class="nm-casing" fill="none" stroke-linecap="round" stroke-linejoin="round">' + casing + '</g><g class="nm-lines" stroke-linecap="round" stroke-linejoin="round" fill="none">' + routes + '</g>';
-    const measure = document.createElement('canvas').getContext('2d'), font = getComputedStyle(document.body).fontFamily;
+    if (railNames) svg += '<g class="nm-rail-names">' + railNames + '</g>';
     // 终点编号也参与避让，不盖住相邻车站和线路；长编号按文字宽度扩展。
     const leaves = new Set(); for (const lid in net.lines) { const tp = M.lineTopo(net, lid); if (tp.leaves) for (const sid of tp.leaves) leaves.add(sid); }
     let endBadges = '';
@@ -663,10 +774,13 @@
     // 站名就近交错、长名分行；位置不足时扩展整张图，不用大量引线把名字拉走。
     const order = []; for (let i = 0; i < N; i++) order.push(i);
     order.sort(function (a, b) { return (linesOf[b].length + (walkSet.has(b) ? 1 : 0)) - (linesOf[a].length + (walkSet.has(a) ? 1 : 0)); });
-    let lab = '', dots = '', needsRoom = false;
+    let lab = '', dots = '', railDots = '', railLab = '', needsRoom = false;
     const DIRS = [[0, -1], [0, 1], [1, 0], [-1, 0], [0.707, -0.707], [-0.707, -0.707], [0.707, 0.707], [-0.707, 0.707]];
     for (const i of order) {
-      const s = net.stations[lay.st[i]], xfer = linesOf[i].length > 1, walk = walkSet.has(i), x = px(i), y = py(i);
+      const s = stOf(lay.st[i]); if (!s) continue;
+      const xfer = linesOf[i].length > 1, walk = walkSet.has(i), x = px(i), y = py(i);
+      // 铁路公司管理的车站按只读样式画（空心虚线圈）；与玩家线路同站换乘时仍按换乘站画
+      const railStation = !!s.rail && !xfer, levels = s.lv && net.stations[s.id] ? M.stationLevels(net, s.id) : null;
       measure.font = (xfer || walk ? '700 ' : '500 ') + LABEL_SIZE + 'px ' + font;
       const rows = stationText(s.name, measure), lineHeight = LABEL_SIZE + 5;
       const tw = Math.ceil(Math.max.apply(null, rows.map(function (t) { return measure.measureText(t).width; }))) + 12, th = rows.length * lineHeight + 4, r = xfer || walk ? 18 : 14;
@@ -689,12 +803,19 @@
       index.add(best.b, 8); expand(best.b);
       if (best.ov || best.dist > r + 18) needsRoom = true;
       const tx = (best.b[0] + 6).toFixed(1), ty = best.b[1] + LABEL_SIZE + 2;
-      lab += '<text data-st="' + s.id + '" data-b="' + best.b[0].toFixed(1) + ' ' + best.b[1].toFixed(1) + ' ' + (best.b[2] - best.b[0]).toFixed(1) + ' ' + (best.b[3] - best.b[1]).toFixed(1) + '" data-ax="' + x.toFixed(1) + '" data-ay="' + y.toFixed(1) + '"' + (leaves.has(s.id) ? ' data-end="1"' : '') + ' x="' + tx + '" y="' + ty.toFixed(1) + '" class="nm-label' + (xfer || walk ? ' x' : '') + '" data-lines="' + linesOf[i].join(' ') + '">' + rows.map(function (text, k) { return '<tspan x="' + tx + '" y="' + (ty + k * lineHeight).toFixed(1) + '">' + U.esc(text) + '</tspan>'; }).join('') + '</text>';
-      const tip = s.name + (xfer ? '（站内换乘：' + linesOf[i].map(function (l) { return net.lines[l].name; }).join('、') + '）' : '') + (walk ? '（可步行换乘）' : '') + ' · ' + (s.lv ? M.levelsText(M.stationLevels(net, s.id)) + '（天地换乘）' : TYPE_NAME[s.type] + '站') + ' · 点击在地图上定位';
-      dots += stationMark(s, x, y, linesOf[i], net, xfer || walk, tip, stationAnchors.get(s.id), s.lv ? M.stationLevels(net, s.id) : null);
+      const label = '<text data-st="' + s.id + '"' + (railStation ? ' data-rail="1"' : '') + ' data-b="' + best.b[0].toFixed(1) + ' ' + best.b[1].toFixed(1) + ' ' + (best.b[2] - best.b[0]).toFixed(1) + ' ' + (best.b[3] - best.b[1]).toFixed(1) + '" data-ax="' + x.toFixed(1) + '" data-ay="' + y.toFixed(1) + '"' + (leaves.has(s.id) ? ' data-end="1"' : '') + ' x="' + tx + '" y="' + ty.toFixed(1) + '" class="nm-label' + (xfer || walk ? ' x' : '') + (railStation ? ' nm-rail-label' : '') + '" data-lines="' + linesOf[i].join(' ') + '">' + rows.map(function (text, k) { return '<tspan x="' + tx + '" y="' + (ty + k * lineHeight).toFixed(1) + '">' + U.esc(text) + '</tspan>'; }).join('') + '</text>';
+      if (railStation) railLab += label; else lab += label;
+      if (railStation) {
+        const col = AX.line(allLines[linesOf[i][0]]) || '#8a6d3b', tip = s.name + ' · 铁路车站（由铁路公司管理）· 点击在地图上定位';
+        railDots += '<circle data-st="' + s.id + '" data-rail="1" cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="5.4" class="nm-st nm-rail-st" stroke="' + col + '" style="stroke-width:2.4;stroke-dasharray:2.6 1.8"><title>' + U.esc(tip) + '</title></circle>';
+      } else {
+        const names = linesOf[i].map(function (l) { const L = allLines[l]; return L ? L.name : '铁路'; });
+        const tip = s.name + (xfer ? '（站内换乘：' + names.join('、') + '）' : '') + (walk ? '（可步行换乘）' : '') + ' · ' + (levels ? M.levelsText(levels) + '（天地换乘）' : TYPE_NAME[s.type] + '站') + ' · 点击在地图上定位';
+        dots += stationMark(s, x, y, linesOf[i], { lines: allLines }, xfer || walk, tip, stationAnchors.get(s.id), levels);
+      }
     }
     if (needsRoom && attempt < 3) return build(g, spacing * 1.3, attempt + 1);
-    svg += '<g class="nm-dots">' + dots + '</g><g class="nm-badges">' + endBadges + '</g><g class="nm-labels">' + lab + '</g></svg>';
+    svg += '<g class="nm-dots nm-rail-dots">' + railDots + '</g><g class="nm-dots">' + dots + '</g><g class="nm-badges">' + endBadges + '</g><g class="nm-labels">' + lab + '</g><g class="nm-rail-labels">' + railLab + '</g></svg>';
     // 留足全部站名与终点编号的边距；改变画幅而不移动任何地形、轨道或站标。
     const fullW = Math.ceil(extent[2] - extent[0]), fullH = Math.ceil(extent[3] - extent[1]);
     svg = svg.replace(/viewBox="[^"]*"/, 'viewBox="' + extent[0] + ' ' + extent[1] + ' ' + fullW + ' ' + fullH + '"');
@@ -859,26 +980,36 @@
       if (!d || d.moved) return;
       const t = document.elementFromPoint(e.clientX, e.clientY);
       const el = t && t.closest ? t.closest('[data-st]') : null;
-      if (el) locate(el.getAttribute('data-st'));
+      if (el) { locate(el.getAttribute('data-st')); return; }
+      // 铁路线路只读：点线不会进入任何可编辑页面，只给一句提示（避免打开未做容错的页面）
+      const rl = t && t.closest ? t.closest('[data-rail-line]') : null;
+      if (rl) railToast('铁路线路由铁路公司管理，不能改建；可在「任务 → 铁路经营权」里查看线路与经营权。');
     });
   }
   function locate(sid) {
     const g = game(); if (!g) return;
-    const net = useDraft && g.draft ? g.draft.net : g.net, s = net.stations[sid];
-    if (!s) return;
-    NetMap.close();
-    ui.select({ kind: 'station', id: sid });
-    ui.flyTo(s.x, s.y, Math.max(ui.R.cam.zoom, 24));
+    try {
+      const net = useDraft && g.draft ? g.draft.net : g.net, rail = railLayer(g);
+      const s = (net.stations && net.stations[sid]) || rail.stations[sid];
+      if (!s) { railToast('这个车站不在当前线网中。'); return; }
+      NetMap.close();
+      ui.select({ kind: 'station', id: sid });
+      ui.flyTo(s.x, s.y, Math.max(ui.R.cam.zoom, 24));
+    } catch (e) { railToast('车站信息暂时无法打开。'); }
   }
-  // 图例：线型与换乘标示
-  function legend() {
+  // 图例：线型与换乘标示；有铁路经营权线路时再加一行只读的铁路样式
+  function legend(rail) {
     const sw = function (type) { return '<svg width="34" height="10" viewBox="0 0 34 10"><path d="M3 5H31" stroke="var(--accent)" stroke-width="' + (type === 'elevated' ? 7 : 5.5) + '" stroke-linecap="round"/>' + (type === 'elevated' ? '<path d="M3 5H31" class="nm-elev"/>' : (type === 'surface' ? '<path d="M3 5H31" class="nm-surf"/>' : '')) + '</svg>'; };
+    const rl = rail && rail.ids && rail.ids.length ? rail.lines[rail.ids[0]] || {} : null, rc = rl ? (AX.line(rl) || '#8a6d3b') : '#8a6d3b';
     return h('div', { class: 'nm-legend' },
       h('span', { html: sw('underground') }), '地下', h('span', { html: sw('elevated') }), '高架', h('span', { html: sw('surface') }), '地面',
       h('span', { class: 'nm-lg-gap' }),
       h('span', { html: '<svg width="32" height="30" viewBox="-16 -15 32 30">' + lgMark('换乘站') + '</svg>' }), '换乘站',
       h('span', { html: '<svg width="64" height="30" viewBox="-16 -15 64 30"><path d="M0 0H32" class="nm-walk-p"/>' + lgMark('换乘站') + '<g transform="translate(32 0)">' + lgMark('换乘站') + '</g></svg>' }), '站外步行换乘',
-      h('span', { html: '<svg width="38" height="32" viewBox="-16 -17 38 32">' + lgMark('天地换乘', ['underground', 'elevated']) + '</svg>' }), '天地换乘');
+      h('span', { html: '<svg width="38" height="32" viewBox="-16 -17 38 32">' + lgMark('天地换乘', ['underground', 'elevated']) + '</svg>' }), '天地换乘',
+      h('span', { class: 'nm-lg-gap' }),
+      h('span', { html: '<svg width="34" height="10" viewBox="0 0 34 10"><path d="M3 5H31" stroke="' + rc + '" stroke-width="7" stroke-linecap="round"/><path d="M3 5H31" stroke="#fff" stroke-width="2" stroke-dasharray="3 3"/></svg>' }), '铁路（只读）',
+      h('span', { html: '<svg width="24" height="22" viewBox="-8 -8 16 16"><circle cx="0" cy="0" r="5.2" fill="var(--surface-solid)" stroke="' + rc + '" stroke-width="2.4" stroke-dasharray="2.6 1.8"/></svg>' }), '铁路车站');
   }
   // 图例里的换乘站标志（两条线路）与天地换乘站（地下 + 高架）
   const LG_NET = { lines: { a: { color: '#f3d03e' }, b: { color: '#00629b' } } };
@@ -939,8 +1070,8 @@
       c.font = '800 ' + (30 * sc) + 'px ' + font; c.fillText((D.city || '') + (isGeo ? '地铁地理线网图' : '地铁线路示意图'), M0, 56 * sc);
       c.font = (15 * sc) + 'px ' + font; c.fillStyle = '#5d6b80';
       let nSt = 0; for (const id in net.stations) if (M.stationLines(net, id).length) nSt++;
-      const KM = lineKm(g);
-      c.fillText('游戏时间 ' + g.clock.y + ' 年 ' + g.clock.m + ' 月' + (useDraft ? '（含建设草案）' : '') + ' · ' + lines.length + ' 条线路 · ' + nSt + ' 座车站 · 线路总长 ' + kmText(KM.total) + ' · 《城市与地铁》', M0, 84 * sc);
+      const KM = lineKm(g), rail = railLayer(g);
+      c.fillText('游戏时间 ' + g.clock.y + ' 年 ' + g.clock.m + ' 月' + (useDraft ? '（含建设草案）' : '') + ' · ' + lines.length + ' 条线路 · ' + nSt + ' 座车站 · 线路总长 ' + kmText(KM.total) + (rail.has ? ' · 铁路 ' + rail.ids.length + ' 条 / ' + Object.keys(rail.stations).length + ' 站（铁路公司管理）' : '') + ' · 《城市与地铁》', M0, 84 * sc);
       c.drawImage(img, (cw - W * sc) / 2, headH, W * sc, H * sc);
       // 线路图例
       let y = headH + H * sc + 18 * sc;
@@ -955,7 +1086,7 @@
         c.fillStyle = '#7a8799'; c.font = (12 * sc) + 'px ' + font; c.fillText(o.tp.stations.length + ' 站 · ' + kmText(KM.get(o.id)), x + 48 * sc + nw, yy);
       });
       c.fillStyle = '#9aa5b5'; c.font = (12 * sc) + 'px ' + font; c.textAlign = 'right';
-      c.fillText('线型：实线为地下，带白色中线为高架，带白色枕木纹为地面；⇄ 圆环为换乘站，虚线相连为站外步行换乘', cw - M0, ch - 38 * sc);
+      c.fillText('线型：实线为地下，带白色中线为高架，带白色枕木纹为地面；⇄ 圆环为换乘站，虚线相连为站外步行换乘' + (rail.has ? '；虚线芯圆圈为铁路公司管理的车站，只读' : ''), cw - M0, ch - 38 * sc);
       c.fillText(isGeo ? '按游戏地图中的实际站点、轨道与地形等比例绘制；共线区间以同心色带区分，站外虚线只表示换乘联系。' : '站点按实际位置统一等比例缩放；同向线路并排，线形为简化示意，不显示地形。', cw - M0, ch - 20 * sc);
       c.textAlign = 'left';
       cv.toBlob(function (blob) {
@@ -985,15 +1116,21 @@
     if (!hasDraft) useDraft = false;
     const net = useDraft && g.draft ? g.draft.net : g.net;
     root.innerHTML = '';
-    const chips = h('div', { class: 'nm-chips' }), KM = lineKm(g);
+    const chips = h('div', { class: 'nm-chips' }), KM = lineKm(g), rail = railLayer(g);
     for (const lid of M.sortIds(Object.keys(net.lines))) {
       const L = net.lines[lid], tp = M.lineTopo(net, lid);
       if (tp.topo === 'empty') continue;
       chips.appendChild(h('button', { class: 'nm-chip', 'data-id': lid, 'data-silent': '1', onclick: function () { focus = focus === lid ? null : lid; applyFocus(); } }, h('span', { class: 'swatch', style: { background: AX.line(L) } }), L.name, h('span', { class: 'tiny muted' }, M.topoName(tp) + ' · ' + tp.stations.length + ' 站 · ' + kmText(KM.get(lid)))));
     }
     const nLines = chips.childNodes.length, nStations = Object.keys(net.stations).filter(function (sid) { return M.stationLines(net, sid).length; }).length;
+    // 铁路线路（只读）：列在图例列表里，标明铁路公司管理；点击只聚焦高亮，不进入改建流程
+    for (const lid of rail.ids) {
+      const L = rail.lines[lid]; if (!L) continue;
+      chips.appendChild(h('button', { class: 'nm-chip nm-rail-chip', 'data-id': lid, 'data-rail': '1', 'data-silent': '1', onclick: function () { focus = focus === lid ? null : lid; applyFocus(); } }, h('span', { class: 'swatch', style: { background: AX.line(L) } }), L.name, h('span', { class: 'tiny muted' }, '铁路公司 · ' + (rail.count[lid] || 0) + ' 站')));
+    }
+    const railStat = rail.has ? Object.keys(rail.stations).length : 0;
     const head = h('div', { class: 'stats-head' }, h('span', { class: 'badge b-blue' }, CM.icon('network')),
-      h('div', { class: 'nm-heading' }, h('h2', null, (CM.DATA.city || '') + '地铁线网'), h('div', { class: 'tiny muted' }, g.clock.y + ' 年 ' + g.clock.m + ' 月 · ' + nLines + ' 条线路 · ' + nStations + ' 座车站 · 线路总长 ' + kmText(KM.total))),
+      h('div', { class: 'nm-heading' }, h('h2', null, (CM.DATA.city || '') + '地铁线网'), h('div', { class: 'tiny muted' }, g.clock.y + ' 年 ' + g.clock.m + ' 月 · ' + nLines + ' 条线路 · ' + nStations + ' 座车站 · 线路总长 ' + kmText(KM.total) + (rail.has ? ' · 铁路 ' + rail.ids.length + ' 条 / ' + railStat + ' 站（铁路公司管理）' : ''))),
       h('div', { class: 'seg-ctl sm nm-mode', 'aria-label': '线路图布局' }, [[true, '地理线网'], [false, '简洁示意']].map(function (o) { return h('button', { class: geographic === o[0] ? 'on' : '', 'aria-pressed': geographic === o[0] ? 'true' : 'false', 'data-silent': '1', onclick: function () { if (geographic !== o[0]) { geographic = o[0]; CM.Sound && CM.Sound.play('soft'); render(); } } }, o[1]); })),
       hasDraft ? h('div', { class: 'seg-ctl sm' }, [[false, '正式网络'], [true, '含草案']].map(function (o) { return h('button', { class: useDraft === o[0] ? 'on' : '', 'data-silent': '1', onclick: function () { if (useDraft !== o[0]) { useDraft = o[0]; focus = null; render(); } } }, o[1]); })) : null,
       h('div', { class: 'grow' }),
@@ -1008,7 +1145,7 @@
     tgt = null;
     const canvas = build(g);
     if (!canvas.classList.contains('nm-canvas')) head.querySelectorAll('.nm-tools button, .btn').forEach(function (b) { b.disabled = true; });
-    const bar = h('div', { class: 'nm-bar' }, chips.childNodes.length ? chips : null, legend(), h('span', { class: 'tiny muted' }, geographic ? '站线与地形等比例 · 可拖动浏览，或显示全图' : '站点位置等比例 · 线路走向示意 · 无地形'));
+    const bar = h('div', { class: 'nm-bar' }, chips.childNodes.length ? chips : null, legend(rail), h('span', { class: 'tiny muted' }, (geographic ? '站线与地形等比例 · 可拖动浏览，或显示全图' : '站点位置等比例 · 线路走向示意 · 无地形') + (rail.has ? ' · 铁路线路与车站由铁路公司管理，不能改建' : '')));
     const body = h('div', { class: 'nm-body' }, bar, canvas);
     // 只有打开时播放入场动画；打开后切换正式 / 含草案或网络变化时就地重绘，不闪动
     const win = h('div', { class: 'stats-win nm-win' + (fresh ? '' : ' static'), onclick: function (e) { e.stopPropagation(); } }, head, body);
@@ -1018,7 +1155,7 @@
     else if (canvas.classList.contains('nm-canvas')) readableView(canvas);
     root.onclick = function () { NetMap.close(); };
     if (canvas.classList.contains('nm-canvas')) bindPanZoom(canvas);
-    if (focus && !net.lines[focus]) focus = null;
+    if (focus && !net.lines[focus] && !rail.lines[focus]) focus = null;
     applyFocus();
   }
 
@@ -1043,6 +1180,8 @@
     exportPNG: function () { exportPNG(); },
     isOpen: function () { return !!root && !root.classList.contains('hidden'); },
     refresh: function (keepView) { if (NetMap.isOpen()) render(!!keepView); },
+    // 供测试与其他模块查询铁路只读层（线路 / 车站 / 区间，来自编译后的线网 overlay）
+    railLayer: function (g) { return railLayer(g || game()); },
   };
   CM.NetMap = NetMap;
 })(window.CM);

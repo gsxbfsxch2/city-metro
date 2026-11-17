@@ -3447,3 +3447,14 @@ body.ops-open #feed > :not(#toasts) { display: none; }
 .mc-content .fo-unit .grow { min-width: 0; overflow-wrap: anywhere; }
 
 .thumb-wait { opacity: 0; }
+
+/* v2.10.2 地图空白自检提示：地面块连续几秒没画出来时显示在屏幕底部（可截图反馈；正常时不出现） */
+#map-diag {
+  position: fixed; left: 8px; right: 8px; bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+  z-index: 2147483646; display: none;
+  background: rgba(96, 20, 20, .95); color: #fff;
+  font: 11.5px/1.5 system-ui, -apple-system, "Noto Sans CJK SC", sans-serif;
+  padding: 8px 10px; border-radius: 8px; white-space: pre-wrap; word-break: break-all;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, .35); pointer-events: none;
+  -webkit-user-select: text; user-select: text;
+}

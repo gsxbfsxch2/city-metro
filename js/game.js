@@ -22,6 +22,9 @@
   // 开局与无有效缓存的读档完成四轮交通求解：createGen / restoreGen 交给工作线程流水线（等待时让出 CM.SIM_WAIT），
   // 由载入界面驱动、不阻塞页面；create / restore 为同步版本（主线程求解，结果逐位相同）
   function drain(gen) { for (;;) { const r = gen.next(); if (r.done) return r.value; } }
+  // 浏览器缓存混用（例如只刷新了部分脚本）时的兼容：铁路模块缺失或版本较旧时退回普通线网编译，不让整局游戏无法开始
+  const railCompile = function (net, g) { const R = CM.RailConcessions; return (R && R.compile) ? R.compile(net, g) : M.compile(net, g && g.city); };
+  const railSync = function (g, net) { const R = CM.RailConcessions; if (R && R.syncNet) R.syncNet(g, net); };
   const lp = function (p, label) { if (CM.loadProgress) CM.loadProgress(p, label); };
   Game.create = function (opts) { return drain(Game.createGen(opts, true)); };
   Game.restore = function (s) { return drain(Game.restoreGen(s, true)); };
@@ -50,7 +53,8 @@
       g.traffic = { v: CFG.TRAFFIC_MODEL };
       g.net = M.empty();
       g.mapInit = buildInitialNetwork(g);   // 开局既有地铁（东京 1950 年等），只在新建时生成一次，随存档保存
-      g.compiled = M.compile(g.net, g.city);
+      railSync(g);   // 铁路车站（v2.8.1）：并入可编辑线网，可查看、接入本线与同站换乘
+      g.compiled = railCompile(g.net, g);
       g.model.setNetwork(g.compiled);
       lp(0.3, '建立交通模型');
       g.econ = new CM.Economy(g.mode, g.clock.y, g.clock.m);
@@ -156,14 +160,15 @@
       if (CM.Eras) { const er = CM.Eras.month(this); if (er) this.logEra(er, false); }
       // 每 5 年刷新一次道路网络与可达性（新区、道路与人口分布改变了出行条件）
       if (m === 1 && (y - y0) % 5 === 0) {
-        city.buildGraphs(); const C = M.compile(this.net, city);
+        city.buildGraphs(); const C = railCompile(this.net, this);
         yield* model.refreshCityGen(C);
         this.compiled = C; if (sync) model.solveNow(1); else yield* model.solveGen(1);
       }
       if ((++n & 3) === 0) yield;
     }
     city.updateStreets(); city.buildGraphs();
-    const C = M.compile(this.net, city);
+    railSync(this);   // 快进到所选年份后同步铁路车站
+    const C = railCompile(this.net, this);
     yield* model.refreshCityGen(C);
     this.compiled = C;
     model.setYear(this.clock.y); model.setDayType(CM.Model.dayType(this.clock.y, this.clock.m, this.clock.d));
@@ -238,7 +243,7 @@
     if (plan.version !== this.netVersion) { this._impactPlan = null; return; }
     const cityVersion = this.city.version, roadVersion = this.city.roadVersion, year = m.year, fare = CM.Model.fareKey(m.fare);
     this.impactReport = { status: 'calculating', at: [this.clock.y, this.clock.m] };
-    const beforeC = M.compile(plan.before, this.city);
+    const beforeC = railCompile(plan.before, this);
     m.predict(this.compiled, plan.lines, res => {
       if (this._impactPlan !== plan || m.retired) return;
       if (this.netVersion !== plan.version || this.city.version !== cityVersion || this.city.roadVersion !== roadVersion || m.year !== year || CM.Model.fareKey(m.fare) !== fare) {
@@ -422,14 +427,18 @@
     yield;
     // 交通刷新节奏（v2.6）：见 trafficDue。不刷新的月份沿用上次的出行结果（模型年份也不变，结果仍算有效），城市发展与经营照常按月结算
     this._graphsDirty = this._graphsDirty || gr.streetsChanged;
-    const bigChange = roadsChanged || regionOpened || gr.newUrban >= Math.max(32, Math.ceil(city.N * .005));
+    // 铁路经营权（v2.8）：线路在现实开通月份出现、每年 1 月可能有新车站或新班次，需要重新编译线网
+    const railway = CM.RailConcessions && CM.RailConcessions.definition(this);
+    const railChanged = railway && ((y === railway.from && m === (railway.month || 1)) || (m === 1 && (CM.RailConcessions.phaseDates[railway.id] || []).includes(y)));
+    if (railChanged) { this._compKey = null; if (this.draft) this.draft.compVer = -1; railSync(this); if (this.draft) { railSync(this, this.draft.net); this.draft.ver++; this.draft.evalVer = -1; } }   // 新车站/新班次：同步车站并强制重新编译线网
+    const bigChange = railChanged || roadsChanged || regionOpened || gr.newUrban >= Math.max(32, Math.ceil(city.N * .005));
     if (this.trafficDue(yr, bigChange)) {
       model.setYear(yr);
       if (this._graphsDirty || roadsChanged) { if (roadsChanged) city.updateStreets(); yield* city.buildGraphsGen(); this._graphsDirty = false; yield; }
       // 编译与模型刷新分多步执行；this.compiled 与模型网络在同一步内一起替换
       // 线网与线路几何没变时沿用上次的编译结果（只取决于线网和城市几何，与日期无关）：省去几十毫秒的同步编译，以及随之重建的三维轨道网格与线网缓存图（v2.6）
-      const compKey = this.netVersion + ':' + city.geoVer + ':' + city.terrainVer;
-      const C = this._compKey === compKey && this.compiled ? this.compiled : M.compile(this.net, city);
+      const compKey = this.netVersion + ':' + (railway && CM.RailConcessions.available(this, railway) ? y : 0) + ':' + city.geoVer + ':' + city.terrainVer;
+      const C = this._compKey === compKey && this.compiled ? this.compiled : railCompile(this.net, this);
       this._compKey = compKey;
       yield;
       yield* model.refreshCityGen(C);
@@ -451,6 +460,7 @@
     if (model.trafficReady()) this.tasks.rebaseCongestion(this);
     this.tasks.monthly(this).forEach((o) => this.logTask(o));
     if(model.hasReviewWork()){yield* model.solveReviewsGen();this.tasks.monthly(this).forEach(o=>this.logTask(o));}
+    if (CM.RailConcessions) CM.RailConcessions.monthly(this);   // 铁路经营权（v2.8）：每月固定费用
     if (CM.Corp) CM.Corp.monthly(this);   // 政府合同（v2.5）：评标、履约考核与付费、招标；履约信誉影响本月拨款
     if (CM.Fleet && this.fleet) CM.Fleet.monthly(this);   // 车队（v2.5）：高峰运力不足、列车超龄提示
     this.econ.payGrant(y, m);
@@ -631,7 +641,7 @@
   };
   Game.prototype.draftCompiled = function () {
     const d = this.draft; if (!d) return null;
-    if (d.compVer !== d.ver) { d.compiled = M.compile(d.net, this.city); d.compVer = d.ver; }
+    if (d.compVer !== d.ver) { d.compiled = railCompile(d.net, this); d.compVer = d.ver; }
     return d.compiled;
   };
   Game.prototype.canConfirm = function () {
@@ -675,7 +685,7 @@
     this.net = d.net;
     this.netVersion++;
     this.rev++;
-    this.compiled = M.compile(this.net, this.city);
+    this.compiled = railCompile(this.net, this);
     if (CM.Fleet && this.fleet) { CM.Fleet.applyAdd(this, ev.fleetAdd); CM.Fleet.sync(this); this.fleet.ver++; }   // 随线配车落实；拆除线路的列车回到车辆段
     this.model.cancelPredict();
     // 沿线拆迁减少了人口与就业：立即重算小区人口岗位与出行需求，不等到月度结算
@@ -696,7 +706,7 @@
   // 运营组织变化（运行交路，v2.5）：不改动轨道、不收费，立即重新编译并按新的路线求解；草案随之重新检查
   Game.prototype.refreshOperations = function () {
     this.netVersion++; this.rev++;
-    this.compiled = M.compile(this.net, this.city);
+    this.compiled = railCompile(this.net, this);
     if (CM.Fleet && this.fleet) { CM.Fleet.sync(this); this.fleet.ver++; }
     this.model.cancelPredict();
     this.model.setNetwork(this.compiled);
@@ -838,7 +848,7 @@
       meta: { gameId: this.id, name: this.name, mode: this.mode, seed: this.seed, createdAt: this.createdAt, gameVersion: CFG.GAME_VERSION, map: this.mapId || 'tk', mapVersion: (CM.MAPS[this.mapId || 'tk'] || {}).mapVersion || 1, scenario: (CM.MAPS[this.mapId || 'tk'] || {}).scenario || '', mapFp: (CM.MAPS[this.mapId || 'tk'] || {}).fp || '' },
       clock: Object.assign({}, this.clock),
       city: this.city.serialize(),
-      net: this.net,
+      net: this.net, railConcession: this.railConcession || undefined, railNotice: this.railNotice || undefined,
       econ: this.econ.serialize(),
       tasks: this.tasks.serialize(),
       corp: this.corp || undefined,   // 地铁公司的政府合同：招标、履约中与已结束的合同、履约信誉（v2.5）
@@ -896,7 +906,11 @@
       g.model.setDayType(CM.Model.dayType(g.clock.y, g.clock.m, g.clock.d));
       g.model.buildZones(); g.model.buildDemand();
       g.net = s.net;
-      g.compiled = M.compile(g.net, g.city);
+      g.railConcession = s.railConcession || null;   // 铁路经营权（v2.8）
+      g.railNotice = s.railNotice || null;
+      railSync(g);   // 旧存档/存档中缺失的铁路车站补进线网（v2.8.1）
+      if (M.normalizePassageNames) M.normalizePassageNames(g.net);   // v2.10.2：旧存档并站两站不同名 → 统一成一个站名（删掉被并站的名字）
+      g.compiled = railCompile(g.net, g);
       g.model.setNetwork(g.compiled);
       g.econ = CM.Economy.restore(s.econ);
       g.model.fare = g.econ.fare;

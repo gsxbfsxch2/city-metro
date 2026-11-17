@@ -52,10 +52,25 @@
     if (!name) return { error: '站名不能为空' };
     const nets = [g.net, g.draft && g.draft.net].filter(Boolean), cur = nets[nets.length - 1].stations[id];
     if (!cur) return { error: '车站已不存在' };
+    if (cur.rail) return { error: '铁路车站的名称由铁路公司管理，不能修改' };
     if (cur.name === name) return { same: true };
-    for (const n of nets) for (const sid in n.stations) if (sid !== id && n.stations[sid].name === name) return { error: '已有同名车站「' + name + '」，请换一个名称' };
+    // 并站的两座车站（v2.9 换乘通道）可以改成同一个站名，按“同一座换乘站”对待
+    const linked = function (n, sid) {
+      const Mx = CM.Metro;
+      if (!Mx || !Mx.passagePairs || !n) return false;
+      try { return (Mx.passagePairs(n) || []).some(function (p) { return (p.a === id && p.b === sid) || (p.b === id && p.a === sid); }); }
+      catch (e) { return false; }
+    };
+    for (const n of nets) for (const sid in n.stations) if (sid !== id && n.stations[sid].name === name && !linked(n, sid)) return { error: '已有同名车站「' + name + '」，请换一个名称' };
     const old = cur.name;
     patchDisplay(g, 'stations', id, { name: name });
+    // 并站的两座车站共用一个站名（v2.9.1）：改其中一座的名字，另一座一起改；铁路车站名称由铁路公司管理，不改
+    let partnerId = null;
+    try { const Mx = CM.Metro; if (Mx && Mx.passagePartner) partnerId = Mx.passagePartner(nets[nets.length - 1], id); } catch (e) { }
+    if (partnerId) {
+      const pn = nets.map(function (n) { return n.stations[partnerId]; }).filter(Boolean)[0];
+      if (pn && !pn.rail) patchDisplay(g, 'stations', partnerId, { name: name });
+    }
     if (g.draft) { g.draft.evalVer = -1; this.renderDraftbar(); }   // 草案说明里的站名随之更新（不改变草案内容与预测）
     const R = this.R; R.labelImage = null; R.metroOrder = null;
     if (CM.NetMap) CM.NetMap.refresh(true);
@@ -300,13 +315,195 @@
     const self = this, g = this.g(), s = (g.draft ? g.draft.net : g.net).stations[id], dc = (s && s.decor) || {};
     return this.sec('st-decor', '车站文化与装修', !dc.style || dc.style === 'auto' ? '随年代' : UI.decorName('style', dc.style), function () { return self.decorBody(id, function () { self.rerenderPage(); }); }, false, 'palette');
   };
+  // 换乘通道（v2.9）：把范围内的一座车站与本站并站，并建一条付费区内的换乘通道（粗实线示意），站外步行换乘变成通道换乘
+  UI.prototype.passageSec = function (id) {
+    const self = this, g = this.g(), Mx = CM.Metro;
+    if (!Mx || !Mx.passagePairs) return null;
+    const latestNet = function () { return g.draft ? g.draft.net : g.net; };
+    const net = latestNet(), s = net.stations[id];
+    if (!s) return null;
+    const rangeM = (function () { try { return (typeof Mx.passageRangeM === 'function' ? Mx.passageRangeM(g) : Mx.passageRangeM) || CFG.walk.transferMaxM; } catch (e) { return CFG.walk.transferMaxM; } })();
+    const pairs = (function () { try { return Mx.passagePairs(net) || []; } catch (e) { return []; } })();
+    const mine = pairs.filter(function (p) { return p.a === id || p.b === id; })[0];
+    return this.sec('st-passage', '并站与换乘通道', mine ? '已并站' : '', function () {
+      const b = h('div');
+      const refresh = function () { self.rerenderPage(); };
+      const run = function (fn, okMsg) {
+        const r = g.edit(function (n) { const q = fn(n); if (q && q.error) return { error: q.error }; return {}; });
+        if (r && r.error) { self.toast(r.error, 'bad'); return; }
+        self.toast(okMsg, 'good'); refresh();
+      };
+      if (mine) {
+        const oid = mine.a === id ? mine.b : mine.a, os = net.stations[oid];
+        b.appendChild(h('div', { class: 'small' }, '已与「' + (os ? os.name : oid) + '」并站：两站之间有一条换乘通道（图中白色圆角长条），约 ' + Math.round(mine.lenM) + ' m，换乘约 ' + Math.max(1, Math.ceil(mine.lenM / CFG.walk.mPerMin)) + ' 分钟，不用出站。两座车站共用一个站名，图中画成一座车站；改其中一站的站名，另一座会一起改。'));
+        b.appendChild(h('div', { class: 'row', style: { flexWrap: 'wrap', gap: '6px', marginTop: '4px' } },
+          h('button', { class: 'btn sm ghost', onclick: function () { if (os) { self.select({ kind: 'station', id: oid }); self.flyTo(os.x, os.y, Math.max(self.R.cam.zoom, 20)); } } }, '查看并站车站'),
+          h('button', { class: 'btn sm ghost', onclick: function () { run(function (n) { return Mx.unlinkStation(n, id); }, '已断开与「' + (os ? os.name : oid) + '」的换乘通道'); } }, '断开换乘通道')));
+        return b;
+      }
+      // 选择并站对象：范围内（默认 500 m）的既有车站，两站都只能有一条通道
+      const occupied = {};
+      for (const p of pairs) { occupied[p.a] = true; occupied[p.b] = true; }
+      const cands = [];
+      for (const oid in net.stations) {
+        if (oid === id) continue;
+        const o = net.stations[oid];
+        if (!o || !o.rail && !g.net.stations[oid]) continue;   // 草案中的新站也可以并站
+        if (occupied[oid]) continue;
+        const mm = U.dist(s.x, s.y, o.x, o.y) * CFG.CELL_M;
+        if (mm > rangeM) continue;
+        if (Mx.passageCheck) { try { const q = Mx.passageCheck(net, id, oid); if (q && !q.ok) continue; } catch (e) { continue; } }
+        cands.push({ id: oid, s: o, m: mm });
+      }
+      cands.sort(function (a, c) { return a.m - c.m; });
+      if (!cands.length) { b.appendChild(h('div', { class: 'note' }, '附近 ' + rangeM + ' m 内没有可并站的车站。先在地图上建一座车站，或在附近新建车站后再试。')); return b; }
+      b.appendChild(h('div', { class: 'note' }, '选择一座 ' + rangeM + ' m 内的车站并站：建设一条换乘通道，两站之间用白色圆角长条连接，乘客可以不出站换乘。并站后两座车站共用一个站名（被并站的原站名会删除），图中画成一座车站。通道长度按两站距离计算，费用计入建设草案，确认后生效。'));
+      for (const c of cands) {
+        let cost = null;
+        if (Mx.passageCost) { try { cost = Mx.passageCost(c.m, g.clock.y); } catch (e) { cost = null; } }
+        b.appendChild(h('div', { class: 'chg small' },
+          h('span', null, (c.s.rail ? '🚄 ' : '') + c.s.name + '（' + CFG.metro.sizeName[c.s.size] + ' · ' + (c.s.rail ? '铁路车站' : CFG.metro.typeName[c.s.type]) + '）'),
+          h('span', { class: 'num' }, Math.round(c.m) + ' m'),
+          h('button', { class: 'btn sm', style: { marginLeft: '6px' }, onclick: function () {
+            run(function (n) {
+              // 并站并共用站名（v2.9.1）：被并站车站的原站名删除，两站改成同一个站名
+              return Mx.linkStationsNamed ? Mx.linkStationsNamed(n, id, c.id) : Mx.linkStations(n, id, c.id);
+            }, '已在草案中与「' + c.s.name + '」并站' + (c.s.rail ? '' : '，两站共用站名「' + s.name + '」') + '：确认建设后通道生效' + (cost != null ? '（' + U.fmtMoney(cost) + '）' : ''));
+          } }, '并站'),
+          h('span', { class: 'grow' })));
+      }
+      return b;
+    }, true);
+  };
+  // 铁路车站页面加载失败时的兜底页（避免整块界面白屏）
+  UI.prototype.railFallbackPage = function (id) {
+    const g = this.g(), self = this, s = g.net.stations[id] || (g.draft && g.draft.net.stations[id]);
+    if (!s) return null;
+    const el = h('div');
+    el.appendChild(this.callout('warn', 'warn', '铁路车站资料暂时无法加载。可以退出本页重试；若地图显示异常，请强制刷新页面（Ctrl+F5）。'));
+    el.appendChild(h('div', { class: 'row', style: { marginTop: '8px' } }, h('button', { class: 'btn sm ghost', onclick: function () { self.flyTo(s.x, s.y, 30); } }, '定位')));
+    return { title: s.name + ' 站', el: el, highlightLine: null };
+  };
   // ======================== 页面：车站 ========================
+  // 铁路车站（金山铁路 / 东海道新干线，v2.9）：与普通车站同样可看每日客流，并可和附近车站并站建换乘通道；但不能改建、移动或拆除
+  UI.prototype.railStationPage = function (id) {
+    const g = this.g(), self = this, net = g.draft ? g.draft.net : g.net, s = net.stations[id];
+    if (!s) return null;
+    const R = CM.RailConcessions, d = R.definition(g), railName = (d && d.name) || '铁路', color = (d && d.color) || '#6b7280';
+    const el = h('div');
+    const lines = M.stationLines(net, id).map(function (l) { return net.lines[l]; }).filter(Boolean);
+    el.appendChild(h('div', { class: 'row', style: { flexWrap: 'wrap', marginBottom: '8px' } },
+      h('span', { class: 'tag', style: { background: color + '22', color: color } }, '● ' + railName),
+      lines.map(function (l) { return h('span', { class: 'tag', style: { background: AX.line(l) + '22', color: AX.line(l) } }, '● ' + l.name); }),
+      lines.length > 1 ? h('span', { class: 'tag xfer' }, s.lv ? '⇄ 天地换乘' : '⇄ 换乘站') : null,
+      h('span', { class: 'tag' }, CFG.metro.sizeName[s.size] + ' · ' + CFG.metro.typeName[s.type]),
+      h('span', { class: 'grow' }), this.favBtn('stations', id)));
+    el.appendChild(this.callout('info', 'train', '铁路车站由铁路公司管理：不能改建、移动或拆除，也不收地铁的运营费用。地铁线路可以直接接入本站，与本线同站换乘；也可以和附近的车站并站、建一条换乘通道。'));
+    const tab = (this._tab && this._tab.railStation) || 'info';
+    el.appendChild(this.pageTabs([['info', '概况', 'chart'], ['rail', '线路与合同', 'train']], tab, function (t) { self._tab = self._tab || {}; self._tab.railStation = t; self.renderPage(false); }));
+    const ret = { title: s.name + ' 站', el: el, highlightLine: null };
+    // 接入本线并换乘：从本站开始绘线，或延长经过本站的已有线路
+    const acts = h('div', { class: 'row', style: { flexWrap: 'wrap', gap: '6px' } });
+    acts.appendChild(h('button', { class: 'btn sm', onclick: function () { self.startDraw(id, 'new'); } }, '从本站新建线路'));
+    for (const l of lines) {
+      const tp = M.lineTopo(net, l.id);
+      if (tp.topo === 'invalid' || !tp.adj || !tp.adj.get(id)) continue;
+      acts.appendChild(h('button', { class: 'btn sm', onclick: function () { self.startDraw(id, l.id, tp.adj.get(id).length >= 2); } }, h('span', { class: 'dot', style: { background: AX.line(l) } }), '延长 ' + l.name));
+    }
+    const isRailAvailable = d && R.available(g, d);
+    if (tab === 'rail') {
+      el.appendChild(this.sec('rail-access', '接入本线与换乘', '', function () {
+        return h('div', null, acts, h('div', { class: 'note', style: { marginTop: '6px' } },
+          lines.length ? '本站已接入 ' + lines.map(function (l) { return '「' + l.name + '」'; }).join('、') + '：在本站换乘，无需出站。'
+            : '从本站新建或延长一条地铁线路即可在本站换乘。线路的站台建设方式与铁路车站不同（如新干线为高架、地铁为地下）时，可按「天地换乘」另设站台层。'));
+      }, true));
+      const stops = d ? R.stops(g, d) : [];
+      if (stops.length) el.appendChild(this.sec('rail-stops', '沿线车站', stops.length + ' 站', function () {
+        const b = h('div');
+        for (const st of stops) b.appendChild(h('div', { class: 'chg small clickable' + (st.id === id ? ' on' : ''), style: { padding: '3px 4px' }, onclick: function () { self.select({ kind: 'station', id: st.id }); self.flyTo(st.x, st.y, Math.max(self.R.cam.zoom, 22)); } },
+          h('span', { class: 'dot', style: { background: color, marginRight: '5px' } }), st.name));
+        return b;
+      }, true));
+      el.appendChild(this.sec('rail-info', '线路资料', '', function () {
+        const rows = [['所属线路', railName], ['最高时速', (d ? d.speed : '—') + ' km/h'], ['现实开通', d ? d.from + ' 年 ' + (d.month || 1) + ' 月' : '—'],
+          ['车站形式', CFG.metro.typeName[s.type] + ' · ' + CFG.metro.sizeName[s.size]], ['建成时间', s.built ? s.built[0] + ' 年 ' + s.built[1] + ' 月' : '—']];
+        if (d && R.available(g, d)) {
+          if (g.railConcession) { const q = R.terms(g, d); rows.push(['本公司合同', '每方向每小时站站停 ' + q.local + ' 班' + (q.express ? ' + 直达 ' + q.express + ' 班' : '') + ' · 每月 ' + U.fmtMoney(q.monthly)]); }
+          else rows.push(['本公司合同', '尚未签约接管']);
+        } else if (d) rows.push(['本公司合同', '现实开通后可在「任务 → 铁路经营权」签约接管']);
+        return self.kv(rows);
+      }, true));
+    } else {
+      // 每日客流：与普通车站一致（铁路车站的进出站与换乘客流包含铁路与地铁两部分）
+      const C = g.model && g.model.net ? g.model.net.C : null, k = C ? C.sIndex.get(id) : undefined;
+      const serviced = k !== undefined && !!(C.serviced && C.serviced[k]);
+      if (serviced && (!g.model.stDaily || g.model.dailyStale)) {
+        el.appendChild(h('div', { class: 'note' }, '客流数据计算中…（新网络投入运营后几秒内完成）'));
+      } else if (serviced) {
+        const sd = g.model.stDaily;
+        const grid = h('div', { class: 'stat-grid' });
+        const sIn = this.stat('日进站（周平均）', '—'), sOut = this.stat('日出站（周平均）', '—'), sX = this.stat('日换乘（周平均）', '—'), sP = this.stat('当前小时负荷', '—');
+        grid.append(sIn, sOut, sX, sP);
+        el.appendChild(grid);
+        const cap = CFG.metro.stationCap[C.stations[k].size];
+        this.live.push(function () {
+          const d2 = g.model.stDaily, dw = g.model.stDailyWk, de = g.model.stDailyWe;
+          if (!d2 || !dw || !de || g.model.dailyStale || g.model.net.C !== C || k >= d2.inn.length) return;
+          const sub = function (a, b) { return '工作日 ' + U.fmtPeople(a) + ' · 周末 ' + U.fmtPeople(b); };
+          sIn.setV(U.fmtPeople(d2.inn[k]) + ' 人次', sub(dw.inn[k], de.inn[k])); sOut.setV(U.fmtPeople(d2.out[k]) + ' 人次', sub(dw.out[k], de.out[k])); sX.setV(U.fmtPeople(d2.xfer[k]) + ' 人次', sub(dw.xfer[k], de.xfer[k]));
+          const W = g.model.weights(g.clock.minute);
+          const f = g.model.stFlowAt(k, W, 'stIn') + g.model.stFlowAt(k, W, 'stOut') + g.model.stFlowAt(k, W, 'stXfer');
+          sP.setV(U.fmtPct(f / cap, 0), U.fmtInt(f) + ' / ' + U.fmtInt(cap) + ' 人次/时', f / cap > 1 ? 'bad' : (f / cap > 0.8 ? 'warn' : 'muted'));
+        });
+        const diag = this.crowdBlock(id, k);
+        if (diag) el.appendChild(diag);
+        el.appendChild(this.sec('st-xfer', '换乘关系', '', function () {
+          const b = h('div');
+          if (lines.length > 1) b.appendChild(h('div', { class: 'small' }, '站内换乘：' + lines.map(function (l) { return l.name; }).join('、')));
+          const acc = g.model.net.acc;
+          const xs = acc.transfers.filter(function (t) { return t.a === k; });
+          if (xs.length) for (const t of xs) {
+            const o = C.stations[t.b];
+            b.appendChild(h('div', { class: 'small clickable', style: { padding: '3px 4px' }, onclick: function () { self.select({ kind: 'station', id: o.id }); } },
+              (t.passage ? '换乘通道：约 ' : '站外换乘：步行 ') + Math.round(t.m) + ' m（约 ' + Math.max(1, Math.ceil(t.m / CFG.walk.mPerMin)) + ' 分钟）至「' + o.name + '」'));
+          }
+          if (lines.length <= 1 && !xs.length) b.appendChild(h('div', { class: 'note' }, '暂无换乘。站外换乘需要两座运营车站之间存在 ' + CFG.walk.transferMaxM + ' m 以内的可步行道路；也可以在本页给两座车站并站、建换乘通道。'));
+          return b;
+        }, true));
+        const ps = this.passageSec(id);
+        if (ps) el.appendChild(ps);
+        el.appendChild(this.sec('st-cover', '步行覆盖', '', function () { return self.coverBlock(s, k, false); }));
+        el.appendChild(this.sec('st-ops', '运营与费用', '', function () {
+          const pw = g.model.stDailyWk, pe = g.model.stDailyWe;
+          return self.kv([['车站容量', U.fmtInt(cap) + ' 人次/小时'], ['日运营费用', '由铁路公司承担（不计入本公司）'], ['建成时间', s.built ? s.built[0] + '年' + s.built[1] + '月' : '—'], ['高峰小时客流', pw && pe ? '工作日 ' + U.fmtInt(pw.peak[k]) + ' · 周末 ' + U.fmtInt(pe.peak[k]) + ' 人次' : U.fmtInt(sd.peak[k]) + ' 人次']]);
+        }));
+      } else if (k !== undefined) {
+        el.appendChild(this.callout('warn', 'warn', '该车站尚未接入运营线路，不提供服务：不计入地铁覆盖，也不产生客流和票款。把它连接到线路并确认建设后生效。'));
+        const ps = this.passageSec(id);
+        if (ps) el.appendChild(ps);
+      } else {
+        el.appendChild(h('div', { class: 'note' }, '客流数据计算中…'));
+      }
+    }
+    el.appendChild(h('div', { class: 'row', style: { marginTop: '8px', flexWrap: 'wrap', gap: '6px' } },
+      h('button', { class: 'btn sm ghost', onclick: function () { self.flyTo(s.x, s.y, 30); } }, '定位'),
+      isRailAvailable ? h('button', { class: 'btn sm ghost', onclick: function () { self.taskTab = 'rail'; self.openPage('tasks', 'rail', { root: true }); } }, '铁路经营权') : null));
+    return ret;
+  };
   // 控件每次都读取最新草案（草案变化后页面自动刷新）；已建状态与草案状态分别说明
   UI.prototype.page_station = function (id) {
     const g = this.g(), self = this;
     const net = g.draft ? g.draft.net : g.net;
     const s = net.stations[id];
     if (!s) return null;
+    // 铁路车站（金山铁路/新干线，v2.8.1）：可以查看、接入本线与同站换乘，但不能改建或拆除
+    if (s.rail) {
+      if (CM.RailConcessions && CM.RailConcessions.syncNet) {
+        try { return this.railStationPage(id); }
+        catch (e) { console.error('railStationPage 加载失败', e); return this.railFallbackPage(id); }   // 兜底：不因车站页面异常白屏
+      }
+      return this.railFallbackPage(id);
+    }
     const latest = function () { return (g.draft ? g.draft.net : g.net).stations[id]; };
     const el = h('div');
     const official = g.net.stations[id];
@@ -353,10 +550,12 @@
         if (lines.length > 1) b.appendChild(h('div', { class: 'small' }, '站内换乘：' + lines.map(function (l) { return l.name; }).join('、')));
         const acc = g.model.net.acc;
         const xs = acc.transfers.filter(function (t) { return t.a === k; });
-        if (xs.length) for (const t of xs) { const o = C.stations[t.b]; b.appendChild(h('div', { class: 'small clickable', style: { padding: '3px 4px' }, onclick: function () { self.select({ kind: 'station', id: o.id }); } }, '站外换乘：步行 ' + Math.round(t.m) + ' m（约 ' + Math.ceil(t.m / CFG.walk.mPerMin) + ' 分钟）至「' + o.name + '」')); }
+        if (xs.length) for (const t of xs) { const o = C.stations[t.b]; b.appendChild(h('div', { class: 'small clickable', style: { padding: '3px 4px' }, onclick: function () { self.select({ kind: 'station', id: o.id }); } }, (t.passage ? '换乘通道：约 ' : '站外换乘：步行 ') + Math.round(t.m) + ' m（约 ' + Math.max(1, Math.ceil(t.m / CFG.walk.mPerMin)) + ' 分钟）至「' + o.name + '」')); }
         if (lines.length <= 1 && !xs.length) b.appendChild(h('div', { class: 'note' }, '暂无换乘。站外换乘需要两座运营车站之间存在 ' + CFG.walk.transferMaxM + ' m 以内的可步行道路。'));
         return b;
       }, true));
+      const ps = this.passageSec(id);
+      if (ps) el.appendChild(ps);
       el.appendChild(this.sec('st-cover', '步行覆盖', '', function () { return self.coverBlock(s, k, false); }));
       // 附近的重要设施（步行 15 分钟内可达本站的设施，v1.9）
       const mdl = g.model, accF = mdl.net.acc, facNear = [];
@@ -376,6 +575,8 @@
       el.appendChild(this.decorBlock(id));
     } else if (official && k !== undefined) {
       el.appendChild(this.callout('warn', 'warn', '该车站尚未接入运营线路，不提供服务：不计入地铁覆盖，也不产生客流和票款。把它连接到线路并确认建设后生效。'));
+      const psU = this.passageSec(id);
+      if (psU) el.appendChild(psU);
       el.appendChild(this.sec('st-cover', '潜在步行覆盖（接入线路后）', '', function () { return self.coverBlock(s, k, true); }));
     } else if (official) {
       el.appendChild(h('div', { class: 'note' }, '客流数据计算中…'));
@@ -847,11 +1048,14 @@
     const g = this.g(), self = this, mu = this.multi;
     if (!mu || (!mu.stations.size && !mu.segs.size)) return null;
     const net = g.draft ? g.draft.net : g.net, mc = CFG.metro, ord = ['S', 'M', 'L'];
-    const st = Array.from(mu.stations).filter(function (id) { return net.stations[id]; });
+    const allSt = Array.from(mu.stations).filter(function (id) { return net.stations[id]; });
+    // 铁路车站由铁路公司管理，不参与批量改建/升级（v2.8.1）
+    const st = allSt.filter(function (id) { return !net.stations[id].rail; });
+    const railCnt = allSt.length - st.length;
     const sg = Array.from(mu.segs).filter(function (id) { return net.segments[id]; });
     const el = h('div');
     const razing = this.tools && this.tools.tool === 'demolish';
-    el.appendChild(h('div', { class: 'note' }, razing ? '已选 ' + st.length + ' 座车站、' + sg.length + ' 段轨道（地图上以红色标出）。Ctrl+点击增减，Shift+拖动框选更多。' : '已选 ' + st.length + ' 座车站、' + sg.length + ' 段轨道（地图上以蓝色标出）。按住 Ctrl 或 Shift 点击地图可继续添加或移除。'));
+    el.appendChild(h('div', { class: 'note' }, (razing ? '已选 ' + st.length + ' 座车站、' + sg.length + ' 段轨道（地图上以红色标出）。Ctrl+点击增减，Shift+拖动框选更多。' : '已选 ' + st.length + ' 座车站、' + sg.length + ' 段轨道（地图上以蓝色标出）。按住 Ctrl 或 Shift 点击地图可继续添加或移除。') + (railCnt ? ' 其中 ' + railCnt + ' 座铁路车站由铁路公司管理，不能改建或拆除，已排除。' : '')));
     const chips = h('div', { class: 'chips' });
     const chip = function (label, color, onRemove) { return h('span', { class: 'chip' }, color ? h('span', { class: 'dot', style: { background: color } }) : null, label, h('button', { class: 'chip-x', 'data-tip': '移出多选', onclick: onRemove }, '×')); };
     for (const id of st) chips.appendChild(chip(net.stations[id].name, null, function () { self.toggleMulti('station', id); }));
@@ -1947,12 +2151,15 @@
     const g = this.g(), T = g.tasks, self = this, ch = g.econ.mode === 'challenge', E = CFG.economy;
     const ym = g.ym();
     const corp = !!(CM.Corp && CM.Corp.enabled(g));   // 政府合同（v2.5）：经营挑战的真实城市
+    const railway = CM.RailConcessions && CM.RailConcessions.definition(g);   // 铁路经营权（v2.8）
     let tab = id || this.taskTab || 'active';
     if (tab === 'ppp' && !corp) tab = 'active';
+    if (tab === 'rail' && !railway) tab = 'active';
     this.taskTab = tab;
     const el = h('div', { class: 'tk-page' });
     const tabs = [['active', '进行中 ' + T.active.length, 'flag'], ['done', '已完成 ' + T.done.length, 'check'], ['failed', '未完成 ' + T.failed.length, 'error']];
     if (corp) tabs.push(['ppp', '合同' + (g.corp ? ' ' + (g.corp.tenders.length + g.corp.contracts.length) : ''), 'briefcase']);
+    if (railway) tabs.push(['rail', '铁路经营权' + (g.railConcession ? ' ✓' : ''), 'train']);
     el.appendChild(this.pageTabs(tabs, tab, function (t) {
       self.taskTab = t; const top = self.stack[self.stack.length - 1]; if (top && top.kind === 'tasks') top.id = t; self.renderPage(false); self.rBody.scrollTop = 0;
     }));
@@ -2100,6 +2307,7 @@
           lineBtn(o),
           h('button', { class: 'btn sm ghost', onclick: function () { T.decline(g, o.id); g.touch(); self.markUnsaved(); self.rerenderPage(); } }, '不感兴趣')));
     };
+    if (tab === 'rail') { this.railTab(body); return { title: '任务', el: el }; }
     if (tab === 'ppp') { this.corpTab(body); return { title: '任务', el: el }; }
     if (tab === 'active') {
       if (!ch) body.appendChild(this.callout('info', 'info', '自由建造模式：任务仅供参考，没有奖励，未完成也不会有后果。'));
@@ -2119,6 +2327,62 @@
     if(T.adjusted&&T.adjusted.length)body.appendChild(this.sec('tk-adjusted','已撤销的目标',T.adjusted.length+' 项',()=>h('div',{class:'note'},'以下目标因设施停用或不具备地铁可改善条件，已撤销且不扣除拨款、不降低满意度：'+T.adjusted.map(t=>t.title).join('；')),false));
     body.appendChild(this.sec('tk-rule', '任务说明', '', function () { return h('div', { class: 'note' }, (D.taskNote || '历史任务不要求按真实线路走向建设。') + '可选挑战接受后才计时，未完成只小幅降低满意度。进度每月初评估。'); }, false, 'info'));
     return { title: '任务', el: el };
+  };
+
+  // 铁路经营权（v2.8）：城市周边的既有铁路（金山铁路 / 东海道新干线）。现实开通前不可签约，
+  // 签约后由本公司接管运营、按合同班次运行、每月付费，并按票款收入分成付给铁路公司。
+  UI.prototype.railTab = function (body) {
+    const g = this.g(), self = this, R = CM.RailConcessions, d = R.definition(g);
+    if (!d) return;
+    const avail = R.available(g, d), st = g.railConcession, q0 = R.terms(g, d);
+    const ymNow = g.clock.y * 12 + (g.clock.m - 1), ymOpen = d.from * 12 + ((d.month || 1) - 1);
+    body.appendChild(this.callout(avail ? (st ? 'good' : 'info') : 'info', 'train',
+      h('div', null, h('b', null, d.name), ' · ' + (st ? '已接管经营权' : (avail ? '可以签约' : '尚未开通'))) ));
+    body.appendChild(h('div', { class: 'note' },
+      '现实开通时间：' + d.from + ' 年 ' + (d.month || 1) + ' 月' + (avail ? '' : '（还有 ' + (ymOpen - ymNow) + ' 个月）') +
+      '。这条铁路不属于本公司的地铁网络，乘客可以照常乘坐；签约后由本公司接管运营、自负盈亏，并按票款收入分成付给铁路公司。'));
+    body.appendChild(this.kv([
+      ['线路类型', d.id === 'tokaido' ? '高速铁路（新干线）' : '市域铁路'],
+      ['最高时速', d.speed + ' km/h（高于普通地铁）'],
+      ['合同班次上限', d.max + ' 班/方向/小时'],
+      ['当前合同', st ? (st.local + ' 班站站停' + (st.express ? ' + ' + st.express + ' 班直达' : '')) : '未签约'],
+    ]));
+    const stList = h('div', { class: 'tk-anchors' });
+    for (const row of d.stations) {
+      const open = !row[3] || g.clock.y >= row[3];
+      stList.appendChild(h('span', { class: 'tk-anchor' + (open ? ' on' : '') }, CM.icon(open ? 'check' : 'hourglass', 12), row[0]));
+    }
+    body.appendChild(this.sec('rail-st', '沿线车站', d.stations.length + ' 站', function () { return stList; }, true));
+    if (!avail) {
+      body.appendChild(h('div', { class: 'note' }, CM.icon('hourglass', 13), ' 按现实开通时间，' + d.from + ' 年 ' + (d.month || 1) + ' 月起可以签约接管；开通当月会收到公告。'));
+      return;
+    }
+    const plan = self._railPlan && self._railPlan.g === g.id ? self._railPlan : { g: g.id, local: st ? st.local : q0.local, express: st ? (st.express || 0) : q0.express };
+    const setPlan = function (l, e) { self._railPlan = { g: g.id, local: l, express: e }; self.rerenderPage(); };
+    const q = R.terms(g, d, plan), due = R.due(g, d, plan);
+    const ops = h('div');
+    const line = function (label, val, minus, plus) {
+      return h('div', { class: 'row', style: { gap: '6px', alignItems: 'center', margin: '4px 0' } },
+        h('span', { style: { minWidth: '86px' } }, label), h('b', null, val + ' 班'),
+        h('button', { class: 'btn sm', disabled: val <= (label === '站站停' ? 1 : 0) ? '' : null, onclick: minus }, '−'),
+        h('button', { class: 'btn sm', disabled: plan.local + plan.express >= d.max ? '' : null, onclick: plus }, '+'));
+    };
+    ops.appendChild(line('站站停', plan.local,
+      function () { setPlan(Math.max(1, plan.local - 1), plan.express); },
+      function () { if (plan.local + plan.express < d.max) setPlan(plan.local + 1, plan.express); }));
+    ops.appendChild(line('直达', plan.express,
+      function () { setPlan(plan.local, Math.max(0, plan.express - 1)); },
+      function () { if (plan.local + plan.express < d.max) setPlan(plan.local, plan.express + 1); }));
+    ops.appendChild(h('div', { class: 'note' }, '首付 ' + U.fmtMoney(st ? 0 : q.entry) + ' · 本次支付 ' + U.fmtMoney(due) + ' · 每月 ' + U.fmtMoney(q.monthly) + '（按票款收入分成另计，约 ' + Math.round((d.share || 0) * 100) + '%）'));
+    ops.appendChild(h('div', { class: 'row', style: { marginTop: '6px' } },
+      h('button', { class: 'btn primary', onclick: function () {
+        const err = R.change(g, plan.local, plan.express);
+        if (err) { self.toast(err, 'bad'); return; }
+        self._railPlan = null; self.markUnsaved(); self.toast(st ? '已更新铁路班次' : '已签约接管 ' + d.name, 'good');
+        self.rerenderPage(); if (self.screenRefresh) self.screenRefresh();
+      } }, st ? '更新班次' : '签约接管'),
+      h('button', { class: 'btn ghost', onclick: function () { self._railPlan = null; self.rerenderPage(); } }, '恢复当前合同')));
+    body.appendChild(this.sec('rail-ops', '运营班次', '每方向每小时', function () { return ops; }, true));
   };
 
   // ======================== 页面：存档 ========================
@@ -2205,10 +2469,19 @@
       '天地换乘：高架线接入地下站会自动加站台层。',
       '贯通、拆开：右键线路，选「贯通、拆开与支线」。',
       'Y 字支线：在同一处可设「主线」方向和「起点端」（主干从哪头发车）。',
-      '共线：连接已有轨道的两站、不加转弯点，就免费沿用；端点站在另一条线上时，可一键「并线」沿它的轨道继续开。',
+      '共线（可选）：工具条「共线」关闭时，本线在已有轨道旁新建自己的独立平行轨道并单独计费；打开「共线」后，连接已有同建设方式轨道的两站才免建设费沿用同一条轨道，高度不同（地下/地面/高架）不能共线。',
+      '并线：端点站在另一条线上时，可一键「并线」沿它的轨道继续开（显式共用轨道）。',
+      '文物保护建筑：历史建筑、地标场地内可以设站，建筑本身不能拆除；历史城区与古建保护范围内只能建地下车站。',
       '平滑曲线：工具条「线形」选「平滑」，Shift+点击放控制柄。',
       '改名、改色：右键车站或线路，或点详情标题。'],
       actions: [] },
+    { id: 'rail', icon: 'train', title: '铁路经营权（金山铁路 / 新干线）', steps: [
+      '城市周边的既有铁路不是本公司的地铁：乘客可以照常乘坐，但收入与运营成本不算本公司的。',
+      '按现实开通时间，到年份与月份后，「任务 → 铁路经营权」里才能签约接管；开通当月会收到公告。',
+      '签约时选择每方向每小时的班次（站站停、直达），班次上限由合同规定；接管后每月付固定费用，并按票款分成付给铁路公司。',
+      '铁路按现实设计时速运行（金山铁路 160 km/h、东海道新干线 210 km/h），班次按合同固定，不会随客流自动加密。',
+      '新横浜等在图外的终点站会夹到地图边缘，站名保留。'],
+      actions: [['flag', '任务', function (ui) { ui.openTop('tasks'); }]] },
     { id: 'time', icon: 'clock', title: '时间太慢，或想看高峰', steps: [
       '最快 24×；也可以点 +1 月、+3 月、+1 年。',
       '打开沙漏「高峰慢放」（{time.peakSlow}），高峰自动放慢到 1×。'],

@@ -107,10 +107,14 @@
     if (daily && compiled) {
       const oi = this.opsIndex(year);
       ops += (daily.carKmW != null ? daily.carKmW : daily.carKm) * CFG.ops.carKmCost * oi;   // v2.5：车厢公里按车型的运营成本系数加权
-      for (const s of compiled.stations) ops += CFG.ops.stationDaily[s.size] * oi;
+      const railOwned = compiled.net.lines.l900000 && compiled.net.lines.l900000.railOwned;
+      for (const s of compiled.stations) if (!s.rail || railOwned) ops += CFG.ops.stationDaily[s.size] * oi;   // 未接管的外部铁路不计本公司运营成本
     }
     this.income('fare', fareWan);
     this.spend('ops', ops);
+    // 铁路经营权（v2.8）：接管线路按票款收入分成付给铁路公司
+    const railway = compiled && compiled.net.lines.l900000;
+    if (railway && railway.railOwned && railway.railShare && daily && daily.ready) this.spend('pppOut', (daily.railFare || 0) * railway.railShare / 10000);
     this.cur.days++;
     if (dt === 'we') this.cur.weDays = (this.cur.weDays || 0) + 1; else if (dt === 'wd') this.cur.wdDays = (this.cur.wdDays || 0) + 1;
     this.lastDay = { fare: fareWan, ops: ops, dt: dt || null };

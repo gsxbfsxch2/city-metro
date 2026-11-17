@@ -1222,6 +1222,30 @@
       }
       for (const v of touched) D_[v] = INF;
     }
+    // 换乘通道（v2.9）：并站后的实体通道，即使两站之间街道步行不通也能换乘；已有步行换乘对时取更小的时间，
+    // 同一对车站不会重复加边（双向各一条，m = 通道长度）。只遍历一次通道表，热路径开销可忽略。
+    if (CM.Metro && C.net && C.sIndex) {
+      const pp = CM.Metro.passagePairs(C.net);
+      if (pp.length) {
+        const byKey = new Map();
+        for (const tr of transfers) {
+          const key = tr.a < tr.b ? tr.a + ':' + tr.b : tr.b + ':' + tr.a;
+          let list = byKey.get(key); if (!list) { list = []; byKey.set(key, list); }
+          list.push(tr);
+        }
+        for (const pr of pp) {
+          const ia = C.sIndex.get(pr.a), ib = C.sIndex.get(pr.b);
+          if (ia == null || ib == null || ia === ib) continue;
+          if (C.serviced && (!C.serviced[ia] || !C.serviced[ib])) continue;
+          const key = ia < ib ? ia + ':' + ib : ib + ':' + ia, m = pr.lenM;
+          const ex = byKey.get(key);
+          if (ex) { for (const tr of ex) if (m < tr.m) { tr.m = m; tr.passage = true; } continue; }   // 通道更短时按通道换乘显示
+          const a = { a: ia, b: ib, m: m, passage: true }, b = { a: ib, b: ia, m: m, passage: true };   // passage 标记：UI 显示「换乘通道」而非「站外步行」
+          transfers.push(a, b);
+          byKey.set(key, [a, b]);
+        }
+      }
+    }
     yield;
     // 小区接驳表（下标 0…Z−1 为小区，Z…Z+F−1 为重要设施）
     const zl = new Array(NZ).fill(null), zCov = new Float32Array(NZ), zWalk = new Float32Array(NZ);
@@ -1391,7 +1415,7 @@
     // freqDir：两个方向各自的发车频率（v2.5 车队，环线两个方向可以不同；其余线路两个方向相同）；needDir：不受车数限制时按客流与最低服务水平所需的频率
     P.freq = new Float32Array(R); P.freqDir = new Float32Array(2 * R); P.needDir = new Float32Array(2 * R); P.crowd = new Float32Array(nE).fill(1); P.load = new Float32Array(nE);
     P.stDelay = new Float32Array(N); P.stIn = new Float32Array(N); P.stOut = new Float32Array(N); P.stXfer = new Float32Array(N); P.stBoard = new Float32Array(N);
-    for (let r = 0; r < R; r++) { P.freq[r] = net.isSvc[r] ? 0 : Model.serviceFloor(net.C.routes[r], p < 0 ? 1 : p); P.freqDir[2 * r] = P.freqDir[2 * r + 1] = P.needDir[2 * r] = P.needDir[2 * r + 1] = P.freq[r]; }   // 加开的交路从停运开始，有配属列车时在求解中升到实际频率
+    for (let r = 0; r < R; r++) { P.freq[r] = Model.railFrequency(net.C.routes[r], p) ?? (net.isSvc[r] ? 0 : Model.serviceFloor(net.C.routes[r], p < 0 ? 1 : p)); P.freqDir[2 * r] = P.freqDir[2 * r + 1] = P.needDir[2 * r] = P.needDir[2 * r + 1] = P.freq[r]; }   // 加开的交路从停运开始，有配属列车时在求解中升到实际频率
     if (old && oldNet && net) {
       const keyIdx = new Map(); oldNet.routeKey.forEach(function (k, i) { keyIdx.set(k, i); });
       for (let r = 0; r < R; r++) {
@@ -1472,7 +1496,7 @@
         const f = Math.max(0.5, fr);
         const w = 60 / (2 * f);
         cost[e] = prm.waitW * w + prm.tpen + P.stDelay[net.eSt[e]];
-        if (stopped && net.isSvc[net.eRoute[e]]) cost[e] = 1e5;   // 加开的交路没有投入列车时不能上车（不算长时间候车）
+        if (stopped && (net.isSvc[net.eRoute[e]] || net.C.routes[net.eRoute[e]].railFreq != null)) cost[e] = 1e5;   // 加开的交路没有投入列车时不能上车（不算长时间候车）
         tAct[e] = w + P.stDelay[net.eSt[e]] * 0.5;
         if (net.eT0[e] > 0) { cost[e] += prm.walkW * net.eT0[e]; tAct[e] += net.eT0[e]; }   // 天地换乘的垂直通道
       } else if (ty === 1) {
@@ -1679,6 +1703,7 @@
           P.needDir[k] = need;
           let f = P.freqDir[k] * 0.55 + need * 0.45;
           if (fp) { const per = 3600 / Math.max(60, rt.cycleSec); f = fp.manual ? Math.min(mc.fMax, Math.min(fp.manual[d][p], fp.avail[d]) * per) : Math.min(f, mc.fMax, fp.avail[d] * per); }
+          if (rt.railFreq != null) f = Model.railFrequency(rt, p);   // 铁路经营权（v2.8）：班次由合同约定，不按客流自动加密
           P.freqDir[k] = f; if (nd === 1) { P.freqDir[k + 1] = f; P.needDir[k + 1] = need; }
         }
         P.freq[r] = nd === 2 ? (P.freqDir[2 * r] + P.freqDir[2 * r + 1]) / 2 : P.freqDir[2 * r];
@@ -1932,9 +1957,19 @@
           const rt = net.C.routes[r], fp = plan && plan[r];
           const svcH = p === 3 ? 5 : h, fd = P.freqDir && P.freqDir.length === 2 * net.R ? P.freqDir[2 * r] + P.freqDir[2 * r + 1] : 2 * P.freq[r];
           const ck = fd * (rt.lenM / 1000) * (fp ? fp.cars : rt.cars) * svcH;
+          if (rt.line.rail && !rt.line.railOwned) continue;   // 未接管的铁路：不计本公司的运营成本
           D.carKm += ck; D.carKmW += ck * (fp ? fp.opsF : 1);
         }
       }
+    }
+    // 铁路经营权（v2.8）：未接管的外部铁路客流不计入本公司票款；接管的线路返给铁路公司一定比例票款
+    if (net && net.C.routes.some(function (rt) { return rt.line.rail; })) {
+      const boards = this.stationDaily(perList, net).routeBoard;
+      const total = boards.reduce(function (sum, v) { return sum + v; }, 0);
+      let external = 0, owned = 0;
+      net.C.routes.forEach(function (rt, i) { if (rt.line.rail) { if (rt.line.railOwned) owned += boards[i]; else external += boards[i]; } });
+      D.railFare = total > 0 ? D.fare * owned / total : 0;
+      if (total > 0) D.fare *= 1 - external / total;
     }
     D.ready = ok;
     return this.finishDaily(D, perList[0] && perList[0].stats, net);
@@ -2074,6 +2109,12 @@
       num += v * road.arcLen[a] * Math.min(8, 1 + CFG.road.bprA * x * x * x * x); den += v * road.arcLen[a];
     }
     return den > 0 ? num / den : 1;
+  };
+  // 铁路经营权（v2.8）：接管线路的班次按合同固定（金山铁路夜间的班次现实中也基本停运）
+  Model.railFrequency = function (rt, p) {
+    if (!rt || rt.railFreq == null) return undefined;
+    if (rt.line.rail === 'jin' && p === 3) return 0;
+    return rt.railFreq;
   };
   // 线路最低服务水平（列/小时）：车站越多、站距越小的城区线越密，站距大的郊区线较疏；非环线保证至少 2 列车在线运行
   Model.serviceFloor = function (rt, p) {

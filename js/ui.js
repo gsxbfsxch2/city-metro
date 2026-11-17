@@ -1135,7 +1135,7 @@
     const colorLine = T.chain && net.lines[T.lineChoice];
     const lineColor = colorLine ? colorLine.color : T.nextLineColor(true);
     const nMulti = this.multi ? this.multi.stations.size + this.multi.segs.size : 0;
-    const key = [T.tool, T.chain, T.lineChoice, T.buildType, T.stationSize, T.curveMode, T.newLineSpeed, g.draft ? g.draft.ver : 0, g.clock.y, gridOn, snapOn, lineColor, nMulti, T.meas.pts.length].join('|');
+    const key = [T.tool, T.chain, T.lineChoice, T.buildType, T.stationSize, T.curveMode, T.newLineSpeed, T.coShare, g.draft ? g.draft.ver : 0, g.clock.y, gridOn, snapOn, lineColor, nMulti, T.meas.pts.length].join('|');
     if (key === this._toKey && !el.classList.contains('hidden')) return;
     this._toKey = key;
     const self = this, mc = CFG.metro, y = g.clock.y;
@@ -1155,6 +1155,8 @@
       return [h('span', { class: 'to-sep' }), h('div', { class: 'seg-ctl sm' }, b)];
     };
     const typeCtl = grp('方式', segc(T.buildType, [['underground', '地下', '造价最高；越江为隧道，可穿越山体与保护建筑'], ['surface', '地面', '造价最低；越江为桥梁，两条地面线不能平交'], ['elevated', '高架', '造价居中；越江为桥梁']], function (v) { T.buildType = v; }));
+    // 共线开关（v2.7）：连接已有轨道的两站时，是否沿用同一条轨道。只有建设方式相同的轨道才能共线；关闭后新建自己的独立平行轨道
+    const coCtl = grp('共线', segc(T.coShare !== false ? 'on' : 'off', [['on', '允许', '连接已有轨道的两站、不加转弯点：沿用同一条轨道，免建设费。只限同一条线形、同一种建设方式（地下/地面/高架）的轨道'], ['off', '关闭', '两站之间已有轨道时，也为本线新建独立平行轨道并单独计费']], function (v) { T.coShare = v !== 'off'; CM.Settings.set('coShare', T.coShare); }));
     const sizeCtl = function (label) { return grp(label, segc(T.stationSize, ['S', 'M', 'L'].map(function (sz) { return [sz, mc.sizeName[sz].replace('型', ''), mc.sizeName[sz] + '车站：' + U.fmtInt(mc.stationCap[sz]) + ' 人次/时 · 编组上限 ' + mc.carsBySize[sz] + ' 节 · 约 ' + U.fmtMoney(M.stationCost(T.buildType, sz, y))]; }), function (v) { T.stationSize = v; })); };
     this._replacingToolOpts = true;
     try { el.innerHTML = ''; } finally { this._replacingToolOpts = false; }
@@ -1185,7 +1187,7 @@
       const speedCtl = grp('速度', colorLine
         ? h('span', { class: 'tag', 'data-tip': '本线最小转弯半径 ' + M.minRadius(colorLine) + ' m；可在线路详情「列车运营」中调整' }, M.lineKmh(colorLine) + ' km/h')
         : segc(T.newLineSpeed || 80, mc.speedGrades.filter(function (x) { return !CM.Fleet || CM.Fleet.speedOpen(g.mapId, y, x.kmh).ok; }).map(function (x) { return [x.kmh, String(x.kmh), x.kmh + ' km/h：最小转弯半径 ' + x.minR + ' m，运营成本 ×' + x.ops.toFixed(2)]; }), function (v) { T.newLineSpeed = v; }));
-      el.append(colorGroup, h('span', { class: 'to-sep' }), typeCtl, sizeCtl('新站'), curveCtl, speedCtl);
+      el.append(colorGroup, h('span', { class: 'to-sep' }), typeCtl, coCtl, sizeCtl('新站'), curveCtl, speedCtl);
       el.append.apply(el, snapCtl());
       if (T.chain) el.appendChild(h('button', { class: 'btn sm ghost', 'data-tip': '结束本次绘线', 'data-key-pre': '右键', 'data-act': 'build.finish', onclick: function () { T.endChain(); } }, ic('check'), '完成'));
     } else if (T.tool === 'station') {
@@ -1391,6 +1393,8 @@
   UI.prototype.demolish = function (t) {
     const g = this.g(); if (!g) return;
     const net = g.draft ? g.draft.net : g.net;
+    if (t.kind === 'station' && net.stations[t.id] && net.stations[t.id].rail) { this.toast('铁路车站由铁路公司管理，不能拆除', 'bad'); return; }
+    if (t.kind === 'seg' && net.segments[t.id] && net.lines[net.segments[t.id].line] && net.lines[net.segments[t.id].line].rail) { this.toast('铁路轨道由铁路公司管理，不能拆除', 'bad'); return; }
     const imp = this.demolishImpact(t);
     let label = '';
     if (t.kind === 'station') { const s = net.stations[t.id]; if (!s) return; label = '车站「' + s.name + '」'; }
@@ -1405,7 +1409,9 @@
   UI.prototype.demolishMulti = function () {
     const g = this.g(), mu = this.multi; if (!g || !mu) return;
     const net = g.draft ? g.draft.net : g.net, R = this.R;
-    const st = Array.from(mu.stations).filter(function (id) { return net.stations[id]; }), sg = Array.from(mu.segs).filter(function (id) { return net.segments[id]; }), n = st.length + sg.length;
+    // 铁路车站（v2.8.1）不参与批量拆除
+    const keepRail = function (id) { return net.stations[id] && !net.stations[id].rail; };
+    const st = Array.from(mu.stations).filter(keepRail), sg = Array.from(mu.segs).filter(function (id) { const sg0 = net.segments[id]; return sg0 && !(net.lines[sg0.line] || {}).rail; }), n = st.length + sg.length;
     if (!n) { this.clearMulti(); return; }
     const imp = this.demolishImpact({ kind: 'many', stations: st, segs: sg });
     for (const id of st) R.addFx('dust', net.stations[id].x, net.stations[id].y);
@@ -1892,11 +1898,15 @@
   };
   // ---------------- 多选（批量修改） ----------------
   UI.prototype.setMulti = function (sel) {
-    this.multi = { stations: new Set(sel.stations || []), segs: new Set(sel.segs || []) };
+    const g = this.g(), net = g && (g.draft ? g.draft.net : g.net);
+    const keep = function (id) { return !(net && net.stations[id] && net.stations[id].rail); };   // 铁路车站不参与批量改建（v2.8.1）
+    this.multi = { stations: new Set((sel.stations || []).filter(keep)), segs: new Set(sel.segs || []) };
     this.pruneMulti();
     if (this.multi) this.openPage('multi', null, { replaceTop: this.topIs(['station', 'line', 'road', 'zone', 'facility', 'multi']) });
   };
   UI.prototype.toggleMulti = function (kind, id) {
+    // 铁路车站不参与多选/批量改建（v2.8.1）
+    if (kind === 'station') { const g = this.g(), net = g && (g.draft ? g.draft.net : g.net); if (net && net.stations[id] && net.stations[id].rail) { this.toast('铁路车站由铁路公司管理，不能批量改建或拆除', 'bad'); return; } }
     if (!this.multi) {
       this.multi = { stations: new Set(), segs: new Set() };
       // 已选中的单个对象作为多选的第一项（拆除工具除外：只拆玩家这次点到的）
@@ -1911,6 +1921,8 @@
   };
   // 框选：把一批对象加入多选
   UI.prototype.addMulti = function (stations, segs) {
+    const g = this.g(), net = g && (g.draft ? g.draft.net : g.net);
+    if (net) stations = stations.filter(function (id) { return net.stations[id] && !net.stations[id].rail; });
     if (!this.multi) this.multi = { stations: new Set(), segs: new Set() };
     for (const id of stations) this.multi.stations.add(id);
     for (const id of segs) this.multi.segs.add(id);

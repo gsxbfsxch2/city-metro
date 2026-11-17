@@ -330,6 +330,88 @@
     return g.speed === 0 && !g.jumping && !g.pending && !g.draft && !R.interacting && t - inputAt > 600 && !waiting && !R.warmUntil && !R.stats.pendingVisible
       && !(R.fx && R.fx.length) && !R.hl && !R.cam.fly && !R.overviewJob && !CM.Follow.active() && !(CM.Tutorial && CM.Tutorial.active());
   };
+  // ---------------- v2.10.2 地图空白自检 ----------------
+  // 玩家反馈「看不到地图」：地面块（道路/水系/街区）没有贴到屏幕上，只剩下地铁与站名。
+  // ① 地面块线程挂死时由渲染器看门狗自动退回主线程绘制（js/render.js）；
+  // ② 这里每帧检查渲染统计，连续几秒一块地面都没贴出来时：清一次地面缓存重画，并在屏幕底部显示一行诊断信息；
+  // ③ 仅在本机调试地址上，自动把诊断数据和当前画面缩略图 POST 到本机诊断端口（排查用，正式部署不会发送）。
+  const SAFE_GROUND = /[?&]safe=1(&|$)/.test(location.search);
+  if (SAFE_GROUND) R.forceMainGround = true;   // 兜底开关：跳过地面块线程，全部由主线程分帧绘制（慢一点，但一定能画出来）
+  let diagEl = null, diagTxt = '', diagAt = 0, blankT = 0, blankGame = null, gndResets = 0, reportAt = 0, reportN = 0;
+  function diagBox() {
+    if (diagEl && diagEl.parentNode) return diagEl;
+    diagEl = document.createElement('div');
+    diagEl.id = 'map-diag';
+    diagEl.setAttribute('role', 'status');
+    (document.body || document.documentElement).appendChild(diagEl);
+    return diagEl;
+  }
+  function diagText() {
+    const st = R.stats || {}, T = R.tiles, v = R.view || { x0: 0, y0: 0, x1: 0, y1: 0 };
+    const line = [
+      'v' + CFG.GAME_VERSION + ' 地图地面没画出来（自检提示，请把这几行截图发给开发者）',
+      '缩放=' + (Math.round(R.z * 10) / 10) + ' 级别=' + (st.targetLevel || 0) + ' 地面块=' + R.ground.size + ' 本帧贴图=' + (st.groundDrawn || 0) + ' 待补=' + (st.pendingVisible || 0),
+      '地面线程=' + (T ? (T.off ? '已停用' : '运行中，等回复=' + T.pending.size + '，已收到=' + T.got) : '未启用') + (T && T.reason ? '（' + T.reason + '）' : ''),
+      '窗口=' + R.w + 'x' + R.h + ' dpr=' + R.dpr + ' 主题=' + R.themeName + ' 视野=' + v.x0.toFixed(1) + ',' + v.y0.toFixed(1) + '~' + v.x1.toFixed(1) + ',' + v.y1.toFixed(1) + '（地图 ' + CFG.W + 'x' + CFG.H + '）',
+      '如一直这样：在网址后加 ?safe=1 再刷新（安全模式，地图改用主线程绘制）'
+    ];
+    return line.join('\n');
+  }
+  function showDiag(text) {
+    const box = diagBox();
+    if (diagTxt !== text) { box.textContent = text; diagTxt = text; }
+    if (box.style.display === 'none') box.style.display = 'block';
+  }
+  function hideDiag() {
+    if (diagEl && diagEl.style.display !== 'none') diagEl.style.display = 'none';
+  }
+  // 本机诊断上报（仅 127.0.0.1/localhost；服务器脚本 scripts/diag-server.mjs，不属于游戏本体）
+  function postProblem(why) {
+    try {
+      const host = location.hostname;
+      if (host !== '127.0.0.1' && host !== 'localhost') return;
+      const st = R.stats || {}, T = R.tiles, g = CM.game;
+      const out = {
+        v: CFG.GAME_VERSION, why: why, url: location.href, ua: navigator.userAgent, host: location.host,
+        map: CM.mapId, theme: R.themeName, w: R.w, h: R.h, dpr: R.dpr, z: Math.round(R.z * 100) / 100, under: R.cam.under, viewMode: R.cam.view,
+        lvl: st.targetLevel, displayed: st.rasterLevel, ground: R.ground.size, iso: R.iso.size, cachePx: Math.round(R.cachePx || 0),
+        pending: st.pendingVisible, tilesOff: T ? T.off : null, tilesReason: T ? T.reason : null, pendingReq: T ? T.pending.size : null,
+        got: T ? T.got : null, nav: { mem: navigator.deviceMemory, cores: navigator.hardwareConcurrency, worker: typeof Worker, offscreen: typeof OffscreenCanvas, path2d: typeof Path2D, bitmap: typeof createImageBitmap },
+        frame: R.frame, seconds: Math.round(R.time * 10) / 10,
+        game: g ? { id: g.id, name: g.name, year: g.clock.y, month: g.clock.m, mode: g.mode } : null,
+        diag: diagText()
+      };
+      try {
+        const cv = document.createElement('canvas'), k = Math.min(1, 640 / canvas.width);
+        cv.width = Math.max(1, Math.round(canvas.width * k)); cv.height = Math.max(1, Math.round(canvas.height * k));
+        cv.getContext('2d').drawImage(canvas, 0, 0, cv.width, cv.height);
+        out.shot = cv.toDataURL('image/jpeg', 0.62);
+      } catch (e) { out.shot = null; }
+      fetch('http://127.0.0.1:8091/diag', { method: 'POST', mode: 'no-cors', body: JSON.stringify(out) }).catch(function () {});
+    } catch (e) { /* 诊断上报失败不影响游戏 */ }
+  }
+  // 每帧检查：地面块是不是一块都没贴出来
+  function checkGroundBlank(now, dt) {
+    const g = CM.game;
+    if (!g || g.preview || R.game !== g) { blankT = 0; hideDiag(); return; }
+    if (blankGame !== g) { blankGame = g; blankT = 0; gndResets = 0; diagTxt = ''; hideDiag(); }
+    const st = R.stats || {}, v = R.view;
+    const inside = v && v.x0 > -2 && v.y0 > -2 && v.x1 < CFG.W + 2 && v.y1 < CFG.H + 2;   // 视野在地图范围内才算
+    const blank = inside && R.z > 6 && (st.groundDrawn || 0) === 0;
+    if (!blank) { blankT = 0; hideDiag(); return; }
+    blankT += dt;
+    if (blankT < 3) return;
+    // 线程已停用、主线程也没画出东西（可能块被误淘汰或在途请求丢了）：清一次地面缓存，从头补画
+    if (blankT > 6 && R.tiles && R.tiles.off && gndResets < 2) {
+      gndResets++;
+      try { R.ground.forEach(function (e) { if (e && e.cv && e.cv.close) e.cv.close(); }); } catch (e) { }
+      R.ground.clear(); R.iso.clear(); R.cachePx = 0;
+      R.displayedLevel = R.requestedLevel = null; R.overview = null; R.overviewStale = true;
+    }
+    if (now - diagAt > 300) { diagAt = now; showDiag(diagText()); }
+    if (now - reportAt > 30000 && reportN < 3) { reportAt = now; reportN++; postProblem('地面块连续 ' + Math.round(blankT) + ' 秒为空白'); }
+  }
+
   function frame(t) {
     const workStarted = performance.now();
     R.frameWorkStart = workStarted;
@@ -354,7 +436,8 @@
     const still = !jumpHold && g && isStill(g, t);
     idleN = still ? idleN + 1 : 0;
     const paint = !jumpHold && (!still || idleN % 6 === 0);
-    if (paint) { if (g && g.jumping) lastJumpPaint = t; try { R.render(dt, ui); } catch (e) { console.error(e); } }
+    if (paint) { if (g && g.jumping) lastJumpPaint = t; try { R.render(dt, ui); } catch (e) { console.error(e); if (window.__fatal) window.__fatal(e && (e.message || String(e)), '渲染'); } }
+    try { checkGroundBlank(performance.now(), dt); } catch (e) { /* 自检自身出错不影响游戏 */ }
     // 界面与环境音是低优先级任务：镜头移动时约 20 次/秒，其余时间每帧（dt 累计，不丢时间）
     uiDt += dt;
     if (!R.interacting || uiDt >= 0.05) {

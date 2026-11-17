@@ -19,6 +19,24 @@
       if (s && s.uiScale) document.documentElement.style.setProperty('--uiz', String(s.uiScale));
     })();
   </script>
+  <script>
+    // 脚本出错时在屏幕底部留一条可复制的错误信息：避免只看到空白地图/卡住却拿不到原因（反馈用）
+    window.__fatal = function (msg, where) {
+      try {
+        if (!msg) return;
+        var box = document.getElementById('fatal-box');
+        if (!box) {
+          box = document.createElement('div');
+          box.id = 'fatal-box';
+          box.style.cssText = 'position:fixed;left:8px;right:8px;bottom:8px;z-index:2147483647;background:#7f1d1d;color:#fff;font:12px/1.5 system-ui,sans-serif;padding:8px 10px;border-radius:8px;white-space:pre-wrap;word-break:break-all;box-shadow:0 6px 18px rgba(0,0,0,.35);pointer-events:none';
+          (document.body || document.documentElement).appendChild(box);
+        }
+        box.textContent = '脚本出错（请把这行信息发给开发者，并再按一次 Ctrl+F5 强制刷新）：' + (where ? where + '：' : '') + msg;
+      } catch (e) { }
+    };
+    window.addEventListener('error', function (e) { window.__fatal(e && (e.message || (e.error && e.error.message))); });
+    window.addEventListener('unhandledrejection', function (e) { var r = e && e.reason; window.__fatal(r && (r.message || String(r))); });
+  </script>
   <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
@@ -39,6 +57,8 @@
   <script src="js/data_tk.js"></script>
   <script src="js/geo_sh.js"></script>
   <script src="js/data_sh.js"></script>
+  <script src="js/geo_sh_outer.js"></script>
+  <script src="js/outer-maps.js"></script>
   <script src="js/maps.js"></script>
   <script src="js/data_eras.js"></script>
   <script src="js/facility.js"></script>
@@ -50,6 +70,7 @@
   <script src="js/economy.js"></script>
   <script src="js/taskplans.js"></script>
   <script src="js/macro.js"></script>
+  <script src="js/rail-concessions.js"></script>
   <script src="js/game.js"></script>
   <script src="js/milestones.js"></script>
   <script src="js/sim-stamp.js"></script>

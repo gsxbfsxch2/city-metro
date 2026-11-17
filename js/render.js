@@ -110,9 +110,11 @@
   // 地面块与总览图在独立线程绘制，主线程只贴图。线程按城市版本同步数据（只在真正要画新块时才同步，跳月期间没有开销）；
   // 线程不可用或出错时退回主线程的分帧绘制（groundChunkGen），画面结果相同
   const GEO_FILES = { tk: 1, sh: 1 };
-  function TilePool(R) { this.R = R; this.list = null; this.off = false; this.pending = new Map(); this.ep = 0; this.sent = {}; this.geo = null; this.ovBusy = false; this.ovAt = -1e9; }
+  // got：已收到的块数；reqAt：最近一次有进展的时间（看门狗用）；reason：线程被停用的原因（诊断显示用）
+  function TilePool(R) { this.R = R; this.list = null; this.off = false; this.pending = new Map(); this.ep = 0; this.sent = {}; this.geo = null; this.ovBusy = false; this.ovAt = -1e9; this.got = 0; this.reqAt = 0; this.reason = ''; }
   TilePool.prototype.ready = function () {
     if (this.off) return false;
+    if (this.R && this.R.forceMainGround) { this.off = true; this.reason = '已开启地图安全模式（?safe=1）'; return false; }   // v2.10.2 兜底开关
     if (typeof Worker === 'undefined' || typeof OffscreenCanvas === 'undefined' || typeof Path2D === 'undefined' || typeof createImageBitmap === 'undefined') { this.off = true; return false; }
     if (this.list && this.geo === CM.GEO) return true;
     this.stop();
@@ -139,9 +141,11 @@
   };
   TilePool.prototype.fail = function (why) {
     if (this.off) return;
-    this.off = true; this.stop();
+    this.off = true; this.reason = String(why || ''); this.stop();
     console.warn('地面块改为主线程绘制：' + why);
   };
+  // v2.10.2 看门狗：线程挂死或消息丢失时以前会一直等下去（地图永远空白）。超时就停用线程，退回主线程分帧绘制。
+  TilePool.prototype.tick = function () { CM.tilePoolTick(this, performance.now()); };
   // 丢弃所有在途结果（换城市、换主题、切语言）
   TilePool.prototype.reset = function () { this.ep++; this.pending.clear(); this.ovBusy = false; };
   // 把变化的城市数据发给线程（一次发送，所有线程共用同一份内容）
@@ -196,6 +200,7 @@
     } catch (e) { this.fail(String(e && e.message || e)); return false; }   // 数据发不过去（不能复制）：退回主线程绘制
     best.n++;
     this.pending.set(q.key, { stale: false });
+    if (!this.reqAt) this.reqAt = performance.now();
     return true;
   };
   TilePool.prototype.requestOverview = function () {
@@ -209,6 +214,7 @@
   };
   TilePool.prototype.done = function (slot, m) {
     if (m.type === 'fail') { this.fail(m.why); return; }
+    this.reqAt = performance.now();
     slot.n = Math.max(0, slot.n - 1);
     const R = this.R;
     if (m.type === 'tile') {
@@ -219,7 +225,7 @@
       if (old) { R.cachePx -= old.px; freeTile(old); }
       const px = m.bitmap.width * m.bitmap.height;
       R.ground.set(m.key, { cv: m.bitmap, lvl: m.lvl, key: m.key, used: R.frame, px: px, stale: p.stale });
-      R.cachePx += px;
+      R.cachePx += px; this.got++;
     } else if (m.type === 'overview') {
       if (m.ep !== this.ep) { m.bitmap.close(); return; }
       this.ovBusy = false;
@@ -2855,6 +2861,7 @@
     this.view = { x0: wx0 - 1, y0: wy0 - 1, x1: wx1 + 1, y1: wy1 + 1 };
     const tStart = performance.now();
     // ---- 地面 ----
+    if (this.tiles) this.tiles.tick();   // v2.10.2：线程无响应时自动改主线程绘制
     const pool = this.tiles && this.tiles.ready() ? this.tiles : null;
     if (pool && !this.overview) this.renderOverviewBase();
     if (this.overviewStale && pool) { if (!g.jumping && !g.pending && !pool.ovBusy && performance.now() - pool.ovAt > 2500) pool.requestOverview(); }
@@ -2873,6 +2880,7 @@
     if (this.overview) {
       ctx.drawImage(this.overview, 0, 0, CFG.W, CFG.H);
     }
+    let groundDrawn = 0;   // v2.10.2：本帧真正贴到屏幕上的地面块数（空白地图自检用）
     if (lvl) {
       const C = CHUNK_PX / lvl;
       const ci0 = Math.max(0, Math.floor(wx0 / C)), ci1 = Math.min(Math.ceil(CFG.W / C) - 1, Math.floor(wx1 / C));
@@ -2904,9 +2912,11 @@
           ctx.save(); ctx.beginPath(); ctx.rect(ci * C - 1 / lvl, cj * C - 1 / lvl, C + 2 / lvl, C + 2 / lvl); ctx.clip();
         }
         ctx.drawImage(e.cv, 0, 0, CHUNK_PX + 2, CHUNK_PX + 2, x0 - 1 / e.lvl, y0 - 1 / e.lvl, C2 + 2 / e.lvl, C2 + 2 / e.lvl);
+        groundDrawn++;
         if (e.lvl !== lvl) ctx.restore();
       }
     }
+    this.stats.groundDrawn = groundDrawn;
     ctx.globalAlpha = 1;
     // ---- 图层（地面） ----
     const layerOn = this.layer !== 'none';
@@ -3145,12 +3155,73 @@
   // ① 轨道按「方式、颜色、透明度、线宽」合并成一条路径描一次（描边次数只随线路颜色数增长）；
   // ② 车站符号预先画进图集，每帧只贴图（stationSprite）；③ 平面视图把线网整张画进带边距的缓存图，
   // 静止、平移时直接贴图，缩放时先缩放旧图、约每 120 ms 重画一次（blitMetroLayer）。拾取用的屏幕坐标按需计算（SegPx）
+  // —— 并排渲染（v2.10）：同一线形上的不同线路必须并排画出来（各用自己的线路色 + 白色虚线中线），不能互相遮挡 ——
+  // 同一几何的区段编成一组：① lane（车道号）代表各线独立的平行轨道，按车道号向外排开；
+  // ② 同一车道上的多条线路（共线共用同一条轨道）按线路编号在左右两侧错开。
+  // 偏移量按绘制线宽换算（laneStep / coStep），因此偏移表只随编译网重建、缩放时无需重算；
+  // 无转弯控制点的直线段不论 curve 标记如何几何都相同，分组时忽略 curve（否则共线两线 curve 标记不同会完全重叠）。
+  const BAND_LANE_MIN = 6.4, BAND_CO_MIN = 3.4;
+  function bandLaneStep(lw) { return Math.max(lw * 1.9 + 2.4, BAND_LANE_MIN); }
+  function bandCoStep(lw) { return Math.max(lw * 1.3, BAND_CO_MIN); }   // 略大于线宽：两条线路色条之间留出深色衬边，互不遮挡
+  function bandKey(s) {
+    const M = CM.Metro, fwd = M.idNum(s.a) <= M.idNum(s.b), pts = (s.pts || []).slice();
+    if (!fwd) pts.reverse();
+    const base = (fwd ? s.a + '|' + s.b : s.b + '|' + s.a) + '|' + s.type;
+    if (!pts.length) return base + '|straight';   // 直线段：curve 标记不改变几何
+    let k = base + '|' + (s.curve === 'smooth' ? 's' : s.curve === 'arc' ? 'a' : '');
+    for (let i = 0; i < pts.length; i++) k += '|' + pts[i][0].toFixed(2) + ',' + pts[i][1].toFixed(2);   // 0.01 格的转弯点差异不影响并排判断
+    return k;
+  }
+  // 偏移表：segId → { lane, co, sgn }（像素数值在绘制时按线宽换算；sgn 处理区段方向反向）
+  function bandPlan(C) {
+    const M = CM.Metro, out = new Map(), groups = new Map();
+    C.segs.forEach(function (cs) {
+      const k = bandKey(cs.seg), g = groups.get(k);
+      if (g) g.push(cs); else groups.set(k, [cs]);
+    });
+    groups.forEach(function (list) {
+      if (list.length < 2) return;
+      const all = new Set();
+      for (const cs of list) all.add(cs.seg.line);
+      if (all.size < 2) return;   // 只有一条线路（例如另一条已删除）：保持原样，不偏移
+      const lanes = new Map();
+      for (const cs of list) {
+        const L = cs.seg.lane || 0, a = lanes.get(L);
+        if (a) a.push(cs); else lanes.set(L, [cs]);
+      }
+      lanes.forEach(function (arr, L) {
+        const ls = M.sortIds(Array.from(new Set(arr.map(function (cs) { return cs.seg.line; })))).filter(function (id) { return C.net.lines[id]; });
+        const multi = ls.length > 1, half = (ls.length - 1) / 2;
+        for (const cs of arr) {
+          const fwd = M.idNum(cs.seg.a) <= M.idNum(cs.seg.b);
+          const co = multi ? ls.indexOf(cs.seg.line) - half : 0;
+          if (!L && !co) continue;   // 只有一条轨道、一条线路：保持原样
+          out.set(cs.seg.id, { lane: L, co: co, sgn: fwd ? 1 : -1 });
+        }
+      });
+    });
+    return out;
+  }
+  // 每份编译网算一次偏移描述（与线宽无关）；绘制时由 SegPx.arr 按当前线宽换算成像素。
+  // host：缓存挂载对象（渲染顺序表 ix 等）。没有并排需求的区段也写上零偏移，完全接管 v2.7 编译期偏移，
+  // 避免「另一条线被删除后剩下的独立轨道」仍然歪在一边。
+  const BAND_ZERO = { lane: 0, co: 0, sgn: 1 };
+  Renderer.prototype.applyBands = function (C, host) {
+    if (host._bandC === C) return;
+    host._bandC = C;
+    const plan = bandPlan(C);
+    C.segs.forEach(function (cs) { cs.band = plan.get(cs.seg.id) || BAND_ZERO; });
+  };
   function SegPx(R) { this.R = R; this.C = null; this.ix = null; this.under = 0; this.lw = 0; this.sh = new Map(); this.vis = null; }
   SegPx.prototype.begin = function (C, ix, under, lw) { this.C = C; this.ix = ix; this.under = under; this.lw = lw; this.sh.clear(); this.vis = null; };
   SegPx.prototype.arr = function (cs) {
-    if (!cs.shift) return this.R.segScreen(cs, this.under);
+    let off = 0;
+    const b = cs.band;
+    if (b) off = (b.lane * bandLaneStep(this.lw) + b.co * bandCoStep(this.lw)) * b.sgn;   // v2.10 并排偏移
+    else if (cs.shift) off = cs.shift * (this.lw + 1.2);                                   // v2.7 编译期偏移（并排逻辑已覆盖，留作兜底）
+    if (!off) return this.R.segScreen(cs, this.under);
     let a = this.sh.get(cs.seg.id);
-    if (!a) { a = shiftArr(this.R.segScreen(cs, this.under), cs.shift * (this.lw + 1.2)); this.sh.set(cs.seg.id, a); }
+    if (!a) { a = shiftArr(this.R.segScreen(cs, this.under), off); this.sh.set(cs.seg.id, a); }
     return a;
   };
   SegPx.prototype.get = function (id) { const cs = this.C && this.C.segs.get(id); return cs ? this.arr(cs) : undefined; };
@@ -3282,7 +3353,7 @@
         if (bb[2] < v.x0 - 6 || bb[0] > v.x1 + 6 || bb[3] < v.y0 - 6 || bb[1] > v.y1 + 6) continue;
         const d = this.segDeco(cs);
         if (!d.water.length) continue;
-        const arr = this.segScreen(cs, under);
+        const arr = this.segPx.arr(cs);   // v2.10 并排：越江隧道同样跟随各自线路的并排偏移
         for (const r of d.water) if (cs.h[(r[0] + r[1]) >> 1] < -DECO_FLAT) { add(wp, arr, r); anyW = true; }
       }
       if (anyW) { ctx.lineCap = 'butt'; ctx.globalAlpha = (1 - 2 * under) * lyrDim; ctx.strokeStyle = TH.trk.tunnelWater; ctx.lineWidth = lw + 4.5; ctx.stroke(wp); ctx.lineCap = 'round'; ctx.globalAlpha = 1; }
@@ -3429,18 +3500,6 @@
     const lyrDim = this.layer === 'cong' || this.layer === 'flow' ? 1 - 0.65 * (this.layerFade || 0) : 1;   // 拥堵、出行方向图层下淡化地铁
     ctx.lineJoin = 'round'; ctx.lineCap = 'round';
     if (!this.segPx) this.segPx = new SegPx(this);
-    // 草案中被删除的正式轨道（虚影）
-    if (draft) {
-      g.compiled.segs.forEach((cs, id) => {
-        if (draft.segs.has(id)) return;
-        let inBase = false;
-        draft.segs.forEach(function (d) { if (d.seg.base && d.seg.base.indexOf(id) >= 0) inBase = true; });
-        if (inBase) return;
-        const arr = this.segScreen(cs, under);
-        ctx.strokeStyle = 'rgba(214,48,49,0.55)'; ctx.lineWidth = lw; ctx.setLineDash([lw * 1.2, lw * 1.2]);
-        this.strokeArr(ctx, arr); ctx.setLineDash([]);
-      });
-    }
     if (!this.metroOrder || this.metroOrder.C !== C) {
       const order = [], rank = { underground: 0, surface: 1, elevated: 2 };
       C.segs.forEach(function (cs) {
@@ -3461,6 +3520,20 @@
       });
     }
     this.segPx.begin(C, ix, under, lw);
+    this.applyBands(C, ix);
+    // 草案中被删除的正式轨道（虚影）：用同一套并排偏移，与正式线网中的位置保持一致
+    if (draft) {
+      this.applyBands(g.compiled, this._ghostBand || (this._ghostBand = {}));
+      g.compiled.segs.forEach((cs, id) => {
+        if (draft.segs.has(id)) return;
+        let inBase = false;
+        draft.segs.forEach(function (d) { if (d.seg.base && d.seg.base.indexOf(id) >= 0) inBase = true; });
+        if (inBase) return;
+        const arr = this.segPx.arr(cs);
+        ctx.strokeStyle = 'rgba(214,48,49,0.55)'; ctx.lineWidth = lw; ctx.setLineDash([lw * 1.2, lw * 1.2]);
+        this.strokeArr(ctx, arr); ctx.setLineDash([]);
+      });
+    }
     this.updateStationPx(C, rs, under);
     if (!draft && under === 0 && t === 0 && C.segs.size >= 150) this.blitMetroLayer(ctx, C, ix, rs, lw, LS, hlLine, lyrDim);
     else this.paintMetro(ctx, C, ix, rs, v, under, t, lw, LS, hlLine, lyrDim, draft);
@@ -3470,6 +3543,7 @@
       if (L) { ctx.globalAlpha = 0.35; ctx.strokeStyle = AX.line(L); ctx.lineWidth = lw + 8; ctx.lineJoin = 'round'; ctx.lineCap = 'round'; this.strokeArr(ctx, this.segPx.arr(cs)); ctx.globalAlpha = 1; }
     }
     this.drawWalkTransferHints(ctx, C, ui, rs.xLinks);
+    this.drawPassages(ctx, C);
     // 草案新站与选中车站的动态标记
     if (draft || (sel && sel.kind === 'station')) {
       const stPx = this.stPx;
@@ -3591,6 +3665,37 @@
     this.walkTransferHints=hints;if(!hints.length)return;
     ctx.save();ctx.strokeStyle=TH.stInter;ctx.globalAlpha=.3;ctx.lineWidth=1.4;ctx.setLineDash([3,5]);ctx.lineCap='round';ctx.beginPath();
     for(const h of hints){for(let i=0;i<h.path.length;i++){const p=this.P(h.path[i][0],h.path[i][1],0);if(i)ctx.lineTo(p.x,p.y);else ctx.moveTo(p.x,p.y);}}ctx.stroke();ctx.restore();
+  };
+  // 并站 / 换乘通道（v2.9 引入，v2.10 改为胶囊外观）：被并站连通的两座车站在画面上并成一座换乘站——
+  // 沿两站中心连线画一个白色圆角长条（深色描边），长度盖过两座站标，读起来是一座合并的换乘站。
+  // 不依赖街道网络，2D 与地下/高架视图都可见；草案中有一端被删除时 passagePairs 不会返回该对，自然不画。
+  Renderer.prototype.drawPassages = function (ctx, C) {
+    const stPx = this.stPx, M = CM.Metro;
+    if (!stPx || !C || !C.sIndex || !C.net || !M || !M.passagePairs) return;
+    const pairs = M.passagePairs(C.net);
+    if (!pairs.length) return;
+    const lw = this.lineWidthPx();
+    const under = U.smooth(this.cam.under), fade = 1 - 0.45 * (this.layerFade || 0);
+    const edge = Math.max(1.4, lw * 0.42);   // 深色描边宽度（v2.9.1：胶囊收窄到站标大小后同步变细）
+    ctx.save();
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.setLineDash([]);
+    for (const p of pairs) {
+      const ia = C.sIndex.get(p.a), ib = C.sIndex.get(p.b);
+      if (ia == null || ib == null) continue;
+      const A = stPx[ia], B = stPx[ib];
+      if (!A || !B) continue;
+      // 胶囊半宽 = 两端站标圆半径（取较大的一个）：整条胶囊的粗细正好是原站标圆的直径，
+      // 再靠外侧的深色描边把两端圆形站标完整盖住，看起来就是「两站并成一座普通车站」。
+      const half = Math.max(A.r, B.r);
+      ctx.globalAlpha = (0.96 - 0.26 * under) * fade;
+      // 深色描边（外轮廓）
+      ctx.strokeStyle = 'rgba(35,44,50,0.92)'; ctx.lineWidth = 2 * (half + edge);
+      ctx.beginPath(); ctx.moveTo(A.x, A.y); ctx.lineTo(B.x, B.y); ctx.stroke();
+      // 白色胶囊本体：round 端点的粗线 = 两端半圆的圆角长条
+      ctx.strokeStyle = TH.stFill; ctx.lineWidth = 2 * half;
+      ctx.beginPath(); ctx.moveTo(A.x, A.y); ctx.lineTo(B.x, B.y); ctx.stroke();
+    }
+    ctx.restore();
   };
   // batched：隧道外廓与越江隧道已在 drawMetro 中合并描边
   Renderer.prototype.drawTrack = function (ctx, cs, arr, col, alpha, width, under, t, batched) {
@@ -5239,6 +5344,24 @@
     if (lr) for (const b of lr) occupy(b[0], b[1], b[2], b[3]);
     const named = this.layer === 'station' && this._layerRectsFor === 'station' ? this._layerNamed : null;
     for (const it of mapLabels) if (it.hub) drawMapLabel(it);
+    // 并站（v2.9.1）：两座车站同名并站时只画一个站名，排在胶囊中点；另一座的车站名不再单独画
+    // 并站一对车站只画一个站名（v2.10.2）：旧存档里两站可能还不同名（v2.10.0 及以前并站不改名），
+    // 这里不再要求同名，一律只画「保留站名」的那一座并排在中点；被并站的名字不再单独显示。
+    const pairMap = new Map();
+    if (C && C.net && CM.Metro && CM.Metro.passagePairs && z >= 8.5 && labOn) {
+      try {
+        for (const pp of CM.Metro.passagePairs(C.net)) {
+          const A = C.net.stations[pp.a], B = C.net.stations[pp.b];
+          if (!A || !B || A.rail || B.rail) continue;   // 铁路车站的名称由铁路公司管理，仍各画各的
+          if (CM.Fac && (CM.Fac.isPortalStation(A) || CM.Fac.isPortalStation(B))) continue;
+          const keepId = CM.Metro.passageKeep ? CM.Metro.passageKeep(C.net, pp.a, pp.b) : pp.a;
+          const keep = C.net.stations[keepId], other = keep === A ? B : A;
+          if (!keep || !other || keep === other) continue;
+          pairMap.set(keep.id, { other: other.id, name: keep.name || other.name || '' });
+          pairMap.set(other.id, { other: keep.id, none: true });
+        }
+      } catch (e) { /* 名字排不上就退回各画各的 */ }
+    }
     if (C && this.stPx && z >= 8.5 && labOn) {
       const fs = 12, ix = this.metroOrder;
       // 排版顺序（线路多、规模大的站优先）每个编译结果只排一次
@@ -5254,6 +5377,21 @@
         const s = C.stations[i];
         if (s.portal && CM.Fac && CM.Fac.isPortalStation(s)) continue;   // 接驳口车站的名称由接驳口名称牌显示
         if (named && named.has(s.id)) continue;
+        const pair = pairMap.get(s.id);
+        if (pair) {
+          if (pair.none || !pair.name) continue;   // 一对并站只画一个站名（被并站的名字已删除）
+          const qi = C.sIndex.get(pair.other), qp = qi != null ? this.stPx[qi] : null;
+          const font = C.stationLines[i].size > 1 ? TYPE.placeMajor : TYPE.place;
+          const w = this.textW(font, pair.name);
+          const cx = qp ? (p.x + qp.x) / 2 : p.x, cy = qp ? (p.y + qp.y) / 2 : p.y, rr = Math.max(p.r, qp ? qp.r : 0);
+          let x = cx, y = cy + rr + fs / 2 + 5;
+          if (!fits(x - w / 2 - 2, y - fs / 2 - 2, x + w / 2 + 2, y + fs / 2 + 2)) {
+            y = cy - rr - fs / 2 - 5;
+            if (!fits(x - w / 2 - 2, y - fs / 2 - 2, x + w / 2 + 2, y + fs / 2 + 2)) continue;
+          }
+          put(pair.name, x, y, font, TH.ink, true, 0, 1, i);
+          continue;
+        }
         const font = C.stationLines[i].size > 1 ? TYPE.placeMajor : TYPE.place;   // 按实际字重测宽，避免换乘站名与旁边标注重叠
         const w = this.textW(font, s.name);
         // 右侧放不下时依次试左侧、上方（图层标注较多时站名仍尽量显示）
@@ -5377,5 +5515,25 @@
     const z = U.clamp(Math.min(this.w / (CFG.W + 4), this.h / (CFG.H + 4)) * 1.05, 5, 96);
     this.flyTo(CFG.W / 2, CFG.H / 2, z); this.cam.fly.duration = 0.9;
   };
+  // v2.10.2 地面块线程看门狗（纯函数，自测脚本直接调用）：返回 null 表示正常，否则返回停用线程的理由。
+  // 第一块要等线程解码地理数据（手机上可能 1~3 秒），给 8 秒；之后每收到一块就重置计时，4 秒没有任何回复即判为挂死。
+  CM.groundWorkerWatch = function (s, now) {
+    if (!s || s.off || !s.list || !s.pending) return null;
+    const pend = typeof s.pending.size === 'number' ? s.pending.size : s.pending;
+    if (!pend || !s.reqAt) return null;
+    const limit = s.got ? 4000 : 8000;
+    if (now - s.reqAt <= limit) return null;
+    return '地面块线程 ' + Math.round((now - s.reqAt) / 1000) + ' 秒没有返回任何数据';
+  };
+  // 看门狗的执行部分（纯函数，自测脚本直接调用）：判为挂死时停用线程（fail），返回停用理由
+  CM.tilePoolTick = function (pool, now) {
+    const why = CM.groundWorkerWatch(pool, now);
+    if (!why) { if (pool && pool.pending && !pool.pending.size) pool.reqAt = 0; return null; }
+    if (pool && typeof pool.fail === 'function') pool.fail(why);
+    else if (pool) { pool.off = true; pool.reason = why; }
+    return why;
+  };
   CM.RENDER_CONST = { EX: EX, HSF: HSF, ISO: ISO, UNDER_DEPTH: UNDER_DEPTH };
+  // 并排渲染偏移表（供自测/调试）：plan(C) → Map(segId → {lane, co, sgn})
+  CM.RENDER_BAND = { key: bandKey, plan: bandPlan, laneStep: bandLaneStep, coStep: bandCoStep };
 })(window.CM);

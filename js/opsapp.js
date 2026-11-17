@@ -383,7 +383,7 @@
     const drawRail = function () {
       for (const k in navs) navs[k].classList.toggle('on', st.root === k);
       const al = A.active(g).length;
-      count(navs.home, al, true); count(navs.lines, Object.keys(g.net.lines).length); count(navs.stations, Object.keys(g.net.stations).length);
+      count(navs.home, al, true); count(navs.lines, Object.keys(g.net.lines).length); count(navs.stations, Object.keys(g.net.stations).filter(function (sid) { return !g.net.stations[sid].rail; }).length);
       if (navs.fleet) count(navs.fleet, g.fleet.trains.length);
       stateEl.className = 'mc-state' + (al ? ' warn' : '');
       stateEl.replaceChildren(h('i'), h('span', null, al ? al + ' 项待处理' : '线网运行平稳'));
@@ -419,7 +419,7 @@
     };
     const stationRows = function () {
       const C = g.model.net ? g.model.net.C : g.compiled, sd = g.model.dailyStale ? null : g.model.stDailyWk || g.model.stDaily;
-      return M.sortIds(Object.keys(g.net.stations)).map(function (sid) {
+      return M.sortIds(Object.keys(g.net.stations).filter(function (sid) { return !g.net.stations[sid].rail; })).map(function (sid) {
         const s = g.net.stations[sid], k = C.sIndex.get(sid), ok = k !== undefined && sd && k < sd.peak.length;
         return { sid: sid, s: s, lines: M.stationLines(g.net, sid), live: k !== undefined && !!C.serviced[k], flow: ok ? sd.inn[k] + sd.out[k] + sd.xfer[k] : 0, load: ok ? sd.peak[k] / CFG.metro.stationCap[s.size] : 0 };
       });

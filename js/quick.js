@@ -49,6 +49,12 @@
   function lineOf(sel) { const n = net(), s = sel.kind === 'seg' ? n.segments[sel.id] : null; return s ? s.line : null; }
   function stationActs(id) {
     const n = net(), s = n.stations[id]; if (!s) return [];
+    // 铁路车站（v2.8.1）：可查看、可从本站绘线接入、可跳到「铁路经营权」；不能改名/改建/拆除
+    if (s.rail) {
+      const acts = [{ icon: 'route', label: '从这里绘线', fn: function (b) { popDraw(id, b); } }];
+      if (CM.RailConcessions) acts.push({ icon: 'train', label: '铁路经营权', fn: function () { ui.taskTab = 'rail'; ui.openPage('tasks', 'rail', { root: true }); } });
+      return acts;
+    }
     const acts = [
       { icon: 'pencil', label: '改名', fn: function (b) { popRename('station', id, b); } },
       { icon: 'route', label: '从这里绘线', fn: function (b) { popDraw(id, b); } },
@@ -115,8 +121,12 @@
     if (k === key) return;
     key = k;
     bar.innerHTML = '';
-    bar.appendChild(h('button', { class: 'ob-name', 'data-tip': '改名', onclick: function (e) { popRename(cur.kind === 'station' ? 'station' : 'line', cur.kind === 'station' ? cur.id : lineOf(cur), e.currentTarget); } },
-      color ? h('span', { class: 'dot', style: { background: color } }) : ic('station', 14), h('span', null, name)));
+    const isRail = cur.kind === 'station' && n.stations[cur.id] && n.stations[cur.id].rail;
+    bar.appendChild(h('button', { class: 'ob-name', 'data-tip': isRail ? '铁路车站 · 查看详情' : '改名', onclick: function (e) {
+      if (isRail) { ui.openObj('station', cur.id, 'info'); return; }
+      popRename(cur.kind === 'station' ? 'station' : 'line', cur.kind === 'station' ? cur.id : lineOf(cur), e.currentTarget);
+    } },
+      color ? h('span', { class: 'dot', style: { background: color } }) : (isRail ? ic('train', 14) : ic('station', 14)), h('span', null, name)));
     for (const a of actsFor(cur)) bar.appendChild(h('button', { class: 'ob-btn' + (a.danger ? ' danger' : ''), 'data-tip': a.label, 'aria-label': a.label, onclick: function (e) { snd('soft'); a.fn(e.currentTarget); } }, ic(a.icon, 17)));
     bar.appendChild(h('button', { class: 'ob-btn', 'data-tip': '详情', 'aria-label': '详情', onclick: function () { if (cur.kind === 'station') ui.openObj('station', cur.id, 'info'); else ui.openObj('line', lineOf(cur) + '|' + cur.id, 'info'); } }, ic('info', 17)));
     if (CM.I18n) CM.I18n.localize(bar);

@@ -36,6 +36,8 @@
     m.cfg = cfg;
     MAPS[m.id] = m;
   }
+  // 上海外围扩展（v2.8）：接入外围地理数据，把 152×152 的市中心地图扩成 384×368；旧存档按 extent 迁移。
+  if (CM.expandOriginalMap) CM.expandOriginalMap(MAPS.sh);
   // 未切换地图之前的初始配置也取默认地图（东京），避免 config.js 里的旧样本尺寸残留在 CFG 中
   const applyCfg = function (m) { for (const k of CFG_KEYS) CFG[k] = k === 'START' ? Object.assign({}, m.cfg.START) : m.cfg[k]; };
   // 地图数据指纹：格网、要素数量与名称表；范围修订提高 mapVersion，原范围内的地形校正由 terrainRevision 识别。

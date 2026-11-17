@@ -12,6 +12,7 @@
     this.lineChoice = 'new';
     this.newLineColor = null; this.newLineSpeed = null;
     this.curveMode = CM.Settings.get('curveMode') === 'pass' ? 'pass' : 'smooth';   // 绘线线形（v2.1）
+    this.coShare = CM.Settings.get('coShare') === true;   // v2.7：默认不再自动共线；在工具条打开「共线」后才沿用既有轨道
     this.chain = null; this.bends = [];
     this.cursor = null; this.hover = null; this.hint = null; this.meas = { pts: [], done: false };
     this.ptr = null; this.drag = null;
@@ -107,7 +108,11 @@
     if (ext) { this.ui.startDraw(ext.station, ext.line, false); this.ptr.extend = true; return; }
     if (e.button === 0 && (this.tool === 'edit' || this.tool === 'line') && !g.jumping && !e.shiftKey) {
       const h = this.pickHandle(e.clientX, e.clientY);
-      if (h && (this.tool === 'edit' || h.kind === 'bend' || h.kind === 'mid')) { this.drag = h; this.drag.changed = false; g.beginLive(); this.ptr.handle = true; }
+      if (h && (this.tool === 'edit' || h.kind === 'bend' || h.kind === 'mid')) {
+        // 铁路车站（v2.8.1）不能拖动
+        if (h.kind === 'station') { const net = this.net(), so = net.stations[h.id]; if (so && so.rail) { this.ui.toast('铁路车站由铁路公司管理，不能移动；可以用「绘线」工具在这里接入本线换乘', 'info'); return; } }
+        this.drag = h; this.drag.changed = false; g.beginLive(); this.ptr.handle = true;
+      }
     }
   };
   Tools.prototype.onMove = function (e) {
@@ -243,8 +248,14 @@
       else if (st && net.stations[st]) {
         const s = net.stations[st];
         tip = { title: s.name, lines: [CFG.metro.sizeName[s.size] + ' · ' + (s.lv ? M.levelsText(M.stationLevels(net, st)) + '（天地换乘）' : CFG.metro.typeName[s.type] + '车站')] };
-        if (this.tool === 'select') tip.lines.push('双击可直接改站名');
-        if (this.tool === 'demolish') this.demolishTip(tip, { kind: 'station', id: st });
+        if (s.rail) {
+          // 铁路车站（v2.8.1）：车站归铁路公司，不能移动/改建/拆除，但可以接入本线换乘
+          const rd = CM.RailConcessions && CM.RailConcessions.definition(g);
+          tip.lines[0] = CFG.metro.sizeName[s.size] + ' · ' + CFG.metro.typeName[s.type] + '车站 · ' + ((rd && rd.name) || '铁路') + '车站';
+          if (this.tool === 'demolish') tip = { title: tip.title, lines: tip.lines.concat(['铁路车站由铁路公司管理，不能拆除']), bad: true };
+          else tip.lines.push('铁路公司管理的车站：不能移动或改建', '可以用「绘线」工具从这里接入本线，同站换乘');
+        } else if (this.tool === 'select') tip.lines.push('双击可直接改站名');
+        if (this.tool === 'demolish' && !s.rail) this.demolishTip(tip, { kind: 'station', id: st });
       } else if (seg && net.segments[seg]) {
         const sg = net.segments[seg], ln = net.lines[sg.line];
         tip = { title: (ln && ln.name ? ln.name + ' · ' : '') + net.stations[sg.a].name + '—' + net.stations[sg.b].name, lines: [CFG.metro.typeName[sg.type] + '轨道'] };
@@ -483,9 +494,18 @@
     const envS = newSt && !mod && !seg && endC >= 0 && g.city.regions[g.city.region[endC]].scenic ? M.envStationFee(this.buildType, this.stationSize, g.clock.y) : 0;
     const herS = newSt && !mod && !seg ? M.heritageStationFee(g.city, end[0], end[1], this.buildType, this.stationSize, g.clock.y) : 0;
     cost += envT + envS + herS;
-    const lines = pv.host ? ['沿用 ' + (net.lines[pv.host.line] ? net.lines[pv.host.line].name : '') + ' 的既有轨道（共线运营），不另收建设费', '需要单独建轨道时，先 Shift+点击加一个转弯点']
+    const lines = pv.host ? ['沿用 ' + (net.lines[pv.host.line] ? net.lines[pv.host.line].name : '') + ' 的既有轨道（共线运营），不另收建设费', '需要单独建轨道时，关闭工具条「共线」，或先 Shift+点击加一个转弯点']
       : ['长度 ' + U.fmtKm(geo.lenM) + (geo.waterM > 1 ? '，' + (this.buildType === 'underground' ? '越江隧道 ' : '跨江桥梁 ') + U.fmtKm(geo.waterM) : '') + ' · 约 ' + U.fmtMoney(cost)];
     let bad = false;
+    // 共线选择（v2.7）：同两站已有轨道时说明为什么沿用 / 为什么不能共线；关闭「共线」时提示按独立轨道计费
+    if (!pv.host && st && !this.bends.length && this.chain) {
+      const lid0 = this.lineChoice !== 'new' && net.lines[this.lineChoice] ? this.lineChoice : '__new';
+      const same = M.coHost(net, this.chain, st, lid0, this.buildType);
+      const other = same || M.coHost(net, this.chain, st, lid0);
+      const otherName = other && net.lines[other.line] ? net.lines[other.line].name : '';
+      if (same && this.coShare === false) lines.push('两站之间已有 ' + otherName + ' 的' + CFG.metro.typeName[same.type] + '轨道：已关闭「共线」，本段新建独立平行轨道并单独计费（可在工具条重新开启共线）');
+      else if (!same && other) lines.push('两站之间已有 ' + otherName + ' 的' + CFG.metro.typeName[other.type] + '轨道：与本线' + CFG.metro.typeName[this.buildType] + '建设方式不同，不能共线，将新建独立轨道');
+    }
     if (mod) lines.unshift('松开 Shift 点击 = 连接；当前为添加转弯点');
     const ty = pv.host ? pv.host.type : this.buildType;
     if (geo.hillM > 1 && ty !== 'underground') { lines.push('经过山地风景区：仅可地下穿越'); bad = true; }
@@ -503,10 +523,11 @@
   };
   // 预览：与正式建设相同的线形规则（站台直线段、与既有线路切线连续）
   // stId：目标为既有车站时，两站之间已有其他线路的轨道且未加转弯点，则沿用该轨道（共线运营）
+  // v2.7：只有建设方式相同、且玩家开启「共线」时才沿用；关闭「共线」时预览按新建独立轨道计算
   Tools.prototype.coHostFor = function (stId) {
-    if (!stId || this.bends.length || !this.chain) return null;
+    if (!stId || this.bends.length || !this.chain || this.coShare === false) return null;
     const net = this.net(), lid = this.lineChoice !== 'new' && net.lines[this.lineChoice] ? this.lineChoice : '__new';
-    return M.coHost(net, this.chain, stId, lid);
+    return M.coHost(net, this.chain, stId, lid, this.buildType);
   };
   // 风景区环境保护费的预览说明：hillM 为景区内轨道长度（米），withStation 为含景区站
   Tools.prototype.envNote = function (hillM, fee, withStation) {
@@ -680,6 +701,13 @@
       const chk = this.siteCheck(w);
       if (!chk.ok) { ui.toast('不能在此建站：' + chk.msg, 'bad'); return; }
     }
+    // 共线与否由玩家选择（v2.7）：只有两站之间已有「建设方式相同」的轨道、且没有加转弯点时才可能共用一条轨道。
+    // 关闭「共线」后按独立轨道建设：同线形的平行轨道用不同的车道号（lane）区分，分别计费、分别绘制。
+    const net0 = this.net();
+    const lid0 = this.lineChoice !== 'new' && net0.lines[this.lineChoice] ? this.lineChoice : '__new';
+    const hostTry = st && !bends.length ? M.coHost(net0, from, st, lid0, this.buildType) : null;
+    const anyHost = st && !bends.length ? M.coHost(net0, from, st, lid0) : null;
+    const share = !!hostTry && this.coShare !== false;
     const r = g.edit(function (net) {
       let lid = self.lineChoice;
       const created = lid === 'new' || !net.lines[lid];
@@ -688,25 +716,34 @@
       if (!to && seg) { const sp = M.splitSegment(net, seg, w.x, w.y, opts, g.city); to = sp.station; }
       if (!to) to = M.addStation(net, w.x, w.y, opts, g.city);
       if (to === from) return { error: '不能连接到同一车站' };
-      // 共线运营：两站之间已有其他线路的轨道且没有加转弯点时，沿用该轨道的线形与建设方式
-      const host = st && !bends.length ? M.coHost(net, from, to, lid) : null;
+      // 共线运营：玩家开启「共线」且两站之间已有同建设方式的轨道时，沿用该轨道的线形与建设方式；否则新建本线自己的轨道
+      const host = share && st && !bends.length ? M.coHost(net, from, to, lid, self.buildType) : null;
       const hp = host ? (host.pts || []).map(function (p) { return [p[0], p[1]]; }) : null;
       const segType = host ? host.type : self.buildType;
+      const newCurve = host ? host.curve : (self.curveMode === 'smooth' ? 'arc' : undefined);
+      const lane = host ? (host.lane || 0) : M.nextLane(net, from, to, bends, newCurve, self.buildType);
       const served = [from, to].map(function (sid) { return M.stationLines(net, sid).indexOf(lid) >= 0; });
-      const res = M.addSegment(net, lid, from, to, host ? (host.a === from ? hp : hp.reverse()) : bends, segType);
+      const res = M.addSegment(net, lid, from, to, host ? (host.a === from ? hp : hp.reverse()) : bends, segType, lane);
       if (res.error) return res;
       // 平滑模式的新区段用圆弧线形（v2.6.1）；共线运营沿用既有轨道的线形。已建车站的站台方向保持不变，既有线路不会被带歪
-      const newCurve = host ? host.curve : (self.curveMode === 'smooth' ? 'arc' : undefined);
       if (newCurve) net.segments[res.id].curve = newCurve;
       if (!host) for (const sid of [from, to]) M.lockPlatform(net, g.net, sid, lid);
       // 天地换乘：本线首次接入一座建设方式不同的既有车站时，为本线单独设站台层（如地下站增设高架站台）
       [from, to].forEach(function (sid, i) { const s0 = net.stations[sid]; if (!served[i] && s0 && s0.type !== segType) { s0.lv = Object.assign({}, s0.lv || {}); s0.lv[lid] = segType; } });
       M.normalizeLevels(net);
       const levels = [from, to].filter(function (sid) { const s0 = net.stations[sid]; return s0 && s0.lv && s0.lv[lid]; }).map(function (sid) { const s0 = net.stations[sid]; return '「' + s0.name + '」增设' + CFG.metro.typeName[s0.lv[lid]] + '站台，与' + CFG.metro.typeName[s0.type] + '站台天地换乘'; });
-      return { lid: lid, to: to, created: created, host: host && net.lines[host.line] ? net.lines[host.line].name : null, levels: levels };
+      return {
+        lid: lid, to: to, created: created, levels: levels, lane: lane,
+        host: host && net.lines[host.line] ? net.lines[host.line].name : null,
+        same: !!hostTry,
+        other: !host && anyHost && net.lines[anyHost.line] ? net.lines[anyHost.line].name + '|' + anyHost.type : '',
+      };
     });
     if (r.error) { ui.toast(r.error, 'bad'); return; }
-    if (r.host) ui.toast('与 ' + r.host + ' 共线运营：沿用这两站之间的既有轨道，不另收建设费（需要单独建轨道时，先 Shift+点击加一个转弯点）', 'info');
+    if (r.host) ui.toast('与 ' + r.host + ' 共线运营：沿用这两站之间的既有轨道，不另收建设费', 'info');
+    else if (r.same) ui.toast('已按独立轨道建设：两站之间另有同建设方式的既有轨道，工具条关闭了「共线」，这段按独立平行轨道计费', 'info');
+    else if (r.other) { const p = r.other.split('|'); ui.toast('两站之间已有 ' + p[0] + ' 的' + CFG.metro.typeName[p[1]] + '轨道：与本线' + CFG.metro.typeName[this.buildType] + '建设方式不同，不能共线，已新建独立轨道', 'info'); }
+    else if (r.lane) ui.toast('已新建独立平行轨道（未与既有轨道共线），这段单独计费', 'info');
     if (r.levels) for (const t of r.levels) ui.toast(t, 'info');   // 各线路站台层可在车站详情中调整
     if (r.created) this.newLineColor = null;
     sfx('lay');
